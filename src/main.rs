@@ -18,7 +18,7 @@ async fn main() {
             if sender.send(line).is_err() { break; }
         }
     });
-    
+
     loop {
         match receiver.try_recv() {
             Ok(message) => {

@@ -56,12 +56,14 @@ async fn handle_connection(stream: TcpStream, stop_word: Arc<Notify>) {
 
     let (reader, _) = tokio::io::split(stream);
     let mut buf_reader = tokio::io::BufReader::new(reader);
+    let mut line = String::new();
     loop {
         if stop_word.notified() {
             break;
         }
-        if buf_reader.fill_buf().await.is_ok() {
-            println!("Data in buffer {:?}", buf_reader.buffer());
+        if buf_reader.read_line(&mut line).await.unwrap() > 0 {
+            println!("Data in buffer {:?}", line);
+            line.clear();
         }
     }
 }
