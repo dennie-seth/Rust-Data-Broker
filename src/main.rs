@@ -8,7 +8,7 @@ use crate::net::server::start_server;
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
     println!("Hello, world!");
-    let (server_state, stop_word) = start_server("127.0.0.1".to_owned(), "8080".to_owned());
+    let (_, stop_word) = start_server("127.0.0.1".to_owned(), "8080".to_owned());
     let (sender, receiver) = mpsc::channel::<String>();
     thread::spawn(move || {
         let mut lock = std::io::stdin().lock();
