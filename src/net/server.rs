@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::io::AsyncBufReadExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
+use crate::config::Config;
 
 #[derive(Debug, Clone)]
 pub enum ServerState {
@@ -106,9 +107,9 @@ impl Server {
     }
 }
 
-pub fn start_server(addr: String, port: String) -> (Arc<Mutex<ServerState>>, Arc<Notify>) {
+pub fn start_server(config: Config) -> Result<(Arc<Mutex<ServerState>>, Arc<Notify>), Box<dyn std::error::Error>> {
     let state = Arc::new(Mutex::new(ServerState::Init));
-    let socket_addr = Addr::new(addr, port);
+    let socket_addr = Addr::new(config.server_addr.to_owned(), config.server_port.to_owned());
     let stop_word = Arc::new(Notify::new());
     let mut server = Server::new(state.clone(), socket_addr.clone(), stop_word.clone());
     
@@ -116,5 +117,5 @@ pub fn start_server(addr: String, port: String) -> (Arc<Mutex<ServerState>>, Arc
         server.run().await;
     });
 
-    (state, stop_word) 
+    Ok((state, stop_word)) 
 }
