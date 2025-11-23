@@ -1,10 +1,54 @@
-﻿use std::net::{SocketAddrV4, };
+﻿use std::collections::HashMap;
+use std::net::{SocketAddrV4, };
+use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::Ordering::Relaxed;
 use tokio::io::AsyncBufReadExt;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex};
 use crate::config::Config;
+
+type Job = Pin<Box<dyn Future<Output = ()> + Send>>;
+#[derive(Debug)]
+struct Pool {
+    map : HashMap<usize, std::sync::mpsc::Sender<Job>>,
+    next_worker: Arc<AtomicUsize>,
+    workers: usize,
+}
+impl Pool {
+    fn new(workers: usize) -> Result<Pool, std::io::Error> {
+        println!("Pool::new called, workers={workers}");
+        let mut map = HashMap::new();
+        for worker_id in 0..workers {
+            let (sender, receiver) = std::sync::mpsc::channel::<Job>();
+            map.insert(worker_id, sender);
+
+            std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread().
+                    enable_all().
+                    build().unwrap();
+                while let Ok(job) = receiver.recv() {
+                    println!("[worker {:?}] got a job", std::thread::current().id());
+                    runtime.block_on(job);
+                    println!("[worker {:?}] finished job", std::thread::current().id());
+                }
+            });
+        }
+        Ok(Pool { map, next_worker: Arc::new(AtomicUsize::new(0)), workers })
+    }
+
+    fn spawn<Fut>(&self, future: Fut) -> Result<(), std::io::Error>
+    where
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let worker_id = self.next_worker.fetch_add(1, Relaxed) % self.workers;
+        if let Some(sender) = self.map.get(&worker_id) {
+            let _ = sender.send(Box::pin(future));
+        }
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone)]
 pub enum ServerState {
@@ -53,7 +97,8 @@ pub struct Server {
     stop_word: Arc<Notify>,
 }
 async fn handle_connection(stream: TcpStream, stop_word: Arc<Notify>) {
-    println!("New connection from {}", stream.peer_addr().unwrap());
+    let peer_addr = stream.peer_addr().unwrap();
+    println!("New connection from {peer_addr}");
 
     let (reader, _) = tokio::io::split(stream);
     let mut buf_reader = tokio::io::BufReader::new(reader);
@@ -62,14 +107,26 @@ async fn handle_connection(stream: TcpStream, stop_word: Arc<Notify>) {
         if stop_word.notified() {
             break;
         }
-        if buf_reader.read_line(&mut line).await.unwrap() > 0 {
-            println!("Data in buffer {:?}", line);
-            line.clear();
+        line.clear();
+        match buf_reader.read_line(&mut line).await {
+            Ok(0) => {
+                println!("Client {peer_addr} disconnected");
+                break;
+            }
+            Ok(_) => {
+                println!("Got message: {:?}", line);
+            }
+            Err(e) => {
+                println!("Read error: {e}");
+                break;
+            }
         }
     }
 }
-fn spawn_connection(socket: TcpStream, stop_word: Arc<Notify>)  {
-    tokio::spawn(async move { handle_connection(socket, stop_word.clone()).await });
+fn spawn_connection(pool: Arc<Pool>, socket: TcpStream, stop_word: Arc<Notify>) -> Result<(), std::io::Error>{
+    println!("New connection from {}", socket.peer_addr()?);
+    let result = pool.spawn(async move { handle_connection(socket, stop_word.clone()).await });
+    result
 }
 impl Server {
     fn new(state: Arc<Mutex<ServerState>>, addr: Addr, stop_word: Arc<Notify>) -> Self {
@@ -79,12 +136,12 @@ impl Server {
             stop_word,
         }
     }
-    pub async fn run(&mut self) {
+    pub async fn run(&mut self, config: Config) -> Result<(), std::io::Error> {
         let listener = TcpListener::bind(&self.addr.addr).await;
         let state = self.state.clone();
         let stop_word = self.stop_word.clone();
-        
-        tokio::spawn(async move {
+        let pool = Arc::new(Pool::new(config.threads_limit as usize)?);
+        {
             *state.lock().await = ServerState::Waiting;
             loop {
                 tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
@@ -92,18 +149,19 @@ impl Server {
                     *state.lock().await = ServerState::Stopped;
                     break;
                 }
-                
+
                 let accepted = listener.as_ref().unwrap().accept().await;
                 match accepted.as_ref() {
                     Ok((_, _)) => {
-                        let (stream, _) = accepted.unwrap();
+                        let (stream, _) = accepted?;
                         *state.lock().await = ServerState::Busy;
-                        spawn_connection(stream, stop_word.clone());
+                        spawn_connection(pool.clone(), stream, stop_word.clone())?;
                     },
                     Err(ref err) => { println!("accept error = {:?}", err); }
                 }
             }
-        });        
+        }
+        Ok(())
     }
 }
 
@@ -114,8 +172,13 @@ pub fn start_server(config: Config) -> Result<(Arc<Mutex<ServerState>>, Arc<Noti
     let mut server = Server::new(state.clone(), socket_addr.clone(), stop_word.clone());
     
     tokio::spawn(async move {
-        server.run().await;
+        let result = server.run(config).await;
+        if result.is_err() {
+            Err(result.err())
+        }
+        else {
+            return Ok(());
+        }
     });
-
     Ok((state, stop_word)) 
 }

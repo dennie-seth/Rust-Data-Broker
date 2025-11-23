@@ -5,4 +5,5 @@ edition = "2024"
 
 [dependencies]
 tokio = { version = "1.48.0", features = ["full"] }
+futures = { version = "0.3.31", features = ["executor"]}
 regex = "1.12.2"

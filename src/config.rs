@@ -16,7 +16,7 @@ pub fn parse_config(path: String) -> Result<Config ,Box<dyn std::error::Error>> 
         server_addr: String::from("127.0.0.1"),
         server_port: String::from("8080"),
     };
-    
+
     if fs::exists(path.clone())? {
         let config_file = fs::read_to_string(path)?;
         let re = Regex::new(r#"(\w+)\s*=\s*(?:"([^"]+)"|(\S+))"#)?;
