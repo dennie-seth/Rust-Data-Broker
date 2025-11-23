@@ -12,16 +12,16 @@ use crate::config::Config;
 type Job = Pin<Box<dyn Future<Output = ()> + Send>>;
 #[derive(Debug)]
 struct Pool {
-    map : HashMap<usize, std::sync::mpsc::Sender<Job>>,
+    map : HashMap<usize, std::sync::mpsc::SyncSender<Job>>,
     next_worker: Arc<AtomicUsize>,
     workers: usize,
 }
 impl Pool {
-    fn new(workers: usize) -> Result<Pool, std::io::Error> {
+    fn new(workers: usize, queue_capacity: usize) -> Result<Pool, std::io::Error> {
         println!("Pool::new called, workers={workers}");
         let mut map = HashMap::new();
         for worker_id in 0..workers {
-            let (sender, receiver) = std::sync::mpsc::channel::<Job>();
+            let (sender, receiver) = std::sync::mpsc::sync_channel::<Job>(queue_capacity);
             map.insert(worker_id, sender);
 
             std::thread::spawn(move || {
@@ -38,13 +38,17 @@ impl Pool {
         Ok(Pool { map, next_worker: Arc::new(AtomicUsize::new(0)), workers })
     }
 
-    fn spawn<Fut>(&self, future: Fut) -> Result<(), std::io::Error>
+    async fn spawn<Fut>(&self, future: Fut) -> Result<(), std::io::Error>
     where
         Fut: Future<Output = ()> + Send + 'static,
     {
         let worker_id = self.next_worker.fetch_add(1, Relaxed) % self.workers;
         if let Some(sender) = self.map.get(&worker_id) {
-            let _ = sender.send(Box::pin(future));
+            let sender = sender.clone();
+            let job = Box::pin(future) as Job;
+            tokio::task::spawn_blocking(move || sender.send(job)).await.
+                map_err(|_| std::io::ErrorKind::BrokenPipe)?.
+                map_err(|_| std::io::ErrorKind::Other)?;
         }
         Ok(())
     }
@@ -123,10 +127,9 @@ async fn handle_connection(stream: TcpStream, stop_word: Arc<Notify>) {
         }
     }
 }
-fn spawn_connection(pool: Arc<Pool>, socket: TcpStream, stop_word: Arc<Notify>) -> Result<(), std::io::Error>{
+async fn spawn_connection(pool: Arc<Pool>, socket: TcpStream, stop_word: Arc<Notify>) -> Result<(), std::io::Error>{
     println!("New connection from {}", socket.peer_addr()?);
-    let result = pool.spawn(async move { handle_connection(socket, stop_word.clone()).await });
-    result
+    pool.spawn(async move { handle_connection(socket, stop_word.clone()).await }).await
 }
 impl Server {
     fn new(state: Arc<Mutex<ServerState>>, addr: Addr, stop_word: Arc<Notify>) -> Self {
@@ -140,7 +143,9 @@ impl Server {
         let listener = TcpListener::bind(&self.addr.addr).await;
         let state = self.state.clone();
         let stop_word = self.stop_word.clone();
-        let pool = Arc::new(Pool::new(config.threads_limit as usize)?);
+        let pool = Arc::new(Pool::new(
+            config.threads_limit as usize,
+            config.wait_limit as usize)?);
         {
             *state.lock().await = ServerState::Waiting;
             loop {
@@ -155,7 +160,7 @@ impl Server {
                     Ok((_, _)) => {
                         let (stream, _) = accepted?;
                         *state.lock().await = ServerState::Busy;
-                        spawn_connection(pool.clone(), stream, stop_word.clone())?;
+                        spawn_connection(pool.clone(), stream, stop_word.clone()).await?;
                     },
                     Err(ref err) => { println!("accept error = {:?}", err); }
                 }

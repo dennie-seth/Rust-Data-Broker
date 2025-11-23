@@ -6,6 +6,7 @@ pub struct Config
 {
     pub threads_limit: u64,
     pub proc_limit: u64,
+    pub wait_limit: u64,
     pub server_addr: String,
     pub server_port: String,
 }
@@ -13,6 +14,7 @@ pub fn parse_config(path: String) -> Result<Config ,Box<dyn std::error::Error>> 
     let mut config = Config { 
         threads_limit: 0, 
         proc_limit: 0,
+        wait_limit: 0,
         server_addr: String::from("127.0.0.1"),
         server_port: String::from("8080"),
     };
@@ -29,6 +31,7 @@ pub fn parse_config(path: String) -> Result<Config ,Box<dyn std::error::Error>> 
         // region: fill config
         config.threads_limit = data.get("THREADS_LIMIT").unwrap().parse::<u64>().unwrap();
         config.proc_limit = data.get("PROC_LIMIT").unwrap().parse::<u64>().unwrap();
+        config.wait_limit = data.get("WAIT_LIMIT").unwrap().parse::<u64>().unwrap();
         config.server_addr = data.get("SERVER_ADDR").unwrap().to_string();
         config.server_port = data.get("SERVER_PORT").unwrap().to_string();
         // endregion
