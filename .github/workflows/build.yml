@@ -1,4 +1,4 @@
-name: Build Data Broker (Win + Linux)
+name: Build DataBroker (Win + Linux)
 
 on:
   push:
@@ -8,7 +8,9 @@ jobs:
   build:
     name: Build on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+
     strategy:
+      fail-fast: false   # <-- важно: не останавливать другие сборки если одна упала
       matrix:
         os: [ubuntu-latest, windows-latest]
 
@@ -27,18 +29,17 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: |
           cd target/release
-          zip data_broker_linux.zip data_broker
+          zip DataBroker_linux.zip DataBroker
 
       # --- ZIP упаковка для Windows ---
       - name: Create ZIP (Windows)
         if: matrix.os == 'windows-latest'
         run: |
           cd target\release
-          powershell Compress-Archive -Path data_broker.exe -DestinationPath data_broker_windows.zip
+          powershell Compress-Archive -Path DataBroker.exe -DestinationPath DataBroker_windows.zip
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: data-broker-${{ matrix.os }}
-          path: |
-            target/release/*.zip
+          name: DataBroker-${{ matrix.os }}
+          path: target/release/*.zip
