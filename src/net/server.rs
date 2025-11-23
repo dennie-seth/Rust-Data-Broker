@@ -140,7 +140,7 @@ impl Server {
         }
     }
     pub async fn run(&mut self, config: Config) -> Result<(), std::io::Error> {
-        let listener = TcpListener::bind(&self.addr.addr).await;
+        let listener = TcpListener::bind(&self.addr.addr).await?;
         let state = self.state.clone();
         let stop_word = self.stop_word.clone();
         let pool = Arc::new(Pool::new(
@@ -155,7 +155,7 @@ impl Server {
                     break;
                 }
 
-                let accepted = listener.as_ref().unwrap().accept().await;
+                let accepted = listener.accept().await;
                 match accepted.as_ref() {
                     Ok((_, _)) => {
                         let (stream, _) = accepted?;
@@ -179,10 +179,8 @@ pub fn start_server(config: Config) -> Result<(Arc<Mutex<ServerState>>, Arc<Noti
     tokio::spawn(async move {
         let result = server.run(config).await;
         if result.is_err() {
-            Err(result.err())
-        }
-        else {
-            return Ok(());
+            println!("Server stopped with error: {:?}", result.err().unwrap());
+            return;
         }
     });
     Ok((state, stop_word)) 
