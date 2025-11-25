@@ -1,0 +1,84 @@
+name: DataBroker – Build & Release (Win + Linux)
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  build:
+    name: Build on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build (release)
+        run: cargo build --release
+
+      # --- Create ZIP for Linux ---
+      - name: Create ZIP (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          cd target/release
+          zip DataBroker_linux.zip DataBroker
+
+      # --- Create ZIP for Windows ---
+      - name: Create ZIP (Windows)
+        if: matrix.os == 'windows-latest'
+        run: |
+          cd target\release
+          powershell Compress-Archive -Path DataBroker.exe -DestinationPath DataBroker_windows.zip
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: zip-${{ matrix.os }}
+          path: target/release/*.zip
+
+  release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all ZIPs
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Show downloaded files
+        run: ls -R dist
+
+      - name: Extract crate version from Cargo.toml
+        id: get_version
+        run: |
+          VERSION=$(grep '^version' Cargo.toml | head -n 1 | cut -d '"' -f2)
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.get_version.outputs.version }}-build-${{ github.run_number }}
+          name: "DataBroker v${{ steps.get_version.outputs.version }} (build ${{ github.run_number }})"
+          body: |
+            Auto-generated DataBroker release for commit ${{ github.sha }} on branch main.
+
+            • Crate version: ${{ steps.get_version.outputs.version }}
+            • GitHub Actions run number: ${{ github.run_number }}
+
+          files: |
+            dist/**/*.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
