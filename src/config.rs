@@ -10,7 +10,7 @@ pub struct Config
     pub server_addr: String,
     pub server_port: String,
 }
-pub fn parse_config(path: String) -> Result<Config ,Box<dyn std::error::Error>> {
+pub(crate) fn parse_config(path: String) -> Result<Config ,Box<dyn std::error::Error>> {
     let mut config = Config { 
         threads_limit: 0, 
         proc_limit: 0,
