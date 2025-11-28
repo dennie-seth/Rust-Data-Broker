@@ -13,8 +13,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Hello, world!");
     
     // region: config reading
-    let config_path = (".settings");
-    let config = parse_config(config_path.to_string())?;
+    let mut config_path= std::env::current_exe().unwrap().parent().unwrap().to_path_buf();
+    config_path = config_path.join(".settings");
+    println!("{:?}", config_path.to_str());
+
+    let config = parse_config(config_path.to_str().unwrap().to_string())?;
     // endregion
     
     // region: server launch
