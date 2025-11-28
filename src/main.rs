@@ -3,7 +3,6 @@ mod config;
 mod tests;
 
 use std::io::BufRead;
-use std::path::PathBuf;
 use std::sync::mpsc;
 use std::thread;
 use crate::config::parse_config;
@@ -14,9 +13,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Hello, world!");
     
     // region: config reading
-    let mut config_path= PathBuf::from(file!()).parent().unwrap().to_path_buf();
-    config_path = config_path.join("..\\configs\\.settings");
-    let config = parse_config(config_path.to_str().unwrap().to_string())?;
+    let config_path = (".settings");
+    let config = parse_config(config_path.to_string())?;
     // endregion
     
     // region: server launch
