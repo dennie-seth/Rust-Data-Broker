@@ -11,13 +11,13 @@ use crate::config::Config;
 
 type Job = Pin<Box<dyn Future<Output = ()> + Send>>;
 #[derive(Debug)]
-struct Pool {
+pub(crate) struct Pool {
     map : HashMap<usize, std::sync::mpsc::SyncSender<Job>>,
     next_worker: Arc<AtomicUsize>,
     workers: usize,
 }
 impl Pool {
-    fn new(workers: usize, queue_capacity: usize) -> Result<Pool, std::io::Error> {
+    pub(crate) fn new(workers: usize, queue_capacity: usize) -> Result<Pool, std::io::Error> {
         println!("Pool::new called, workers={workers}");
         let mut map = HashMap::new();
         for worker_id in 0..workers {
@@ -38,7 +38,7 @@ impl Pool {
         Ok(Pool { map, next_worker: Arc::new(AtomicUsize::new(0)), workers })
     }
 
-    async fn spawn<Fut>(&self, future: Fut) -> Result<(), std::io::Error>
+    pub(crate) async fn spawn<Fut>(&self, future: Fut) -> Result<(), std::io::Error>
     where
         Fut: Future<Output = ()> + Send + 'static,
     {
@@ -55,7 +55,7 @@ impl Pool {
 }
 
 #[derive(Debug, Clone)]
-pub enum ServerState {
+pub(crate) enum ServerState {
     Init,
     Waiting,
     Busy,
@@ -76,26 +76,26 @@ impl Addr {
 }
 
 #[derive(Debug, Clone)]
-pub struct Notify {
+pub(crate) struct Notify {
     is_notified: Arc<AtomicBool>,
 }
 
 impl Notify {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             is_notified: Arc::new(AtomicBool::new(false)),
         }
     }
-    pub fn notify(&self) {
+    pub(crate) fn notify(&self) {
         self.is_notified.store(true, Ordering::Release);
     }
-    fn notified(&self) -> bool {
+    pub(crate) fn notified(&self) -> bool {
         self.is_notified.load(Ordering::Acquire)
     }
 }
 
 #[derive(Debug, Clone)]
-pub struct Server {
+pub(crate) struct Server {
     state: Arc<Mutex<ServerState>>,
     addr: Addr,
     stop_word: Arc<Notify>,
@@ -139,7 +139,7 @@ impl Server {
             stop_word,
         }
     }
-    pub async fn run(&mut self, config: Config) -> Result<(), std::io::Error> {
+    pub(crate) async fn run(&mut self, config: Config) -> Result<(), std::io::Error> {
         let listener = TcpListener::bind(&self.addr.addr).await?;
         let state = self.state.clone();
         let stop_word = self.stop_word.clone();
@@ -155,14 +155,23 @@ impl Server {
                     break;
                 }
 
-                let accepted = listener.accept().await;
-                match accepted.as_ref() {
-                    Ok((_, _)) => {
-                        let (stream, _) = accepted?;
+                let accept_result =
+                    tokio::time::timeout(
+                        tokio::time::Duration::from_millis(50),
+                        listener.accept(),
+                    ).await;
+                match accept_result {
+                    Err(_elapsed) => {
+                        continue;
+                    }
+                    Ok(Err(e)) => {
+                        println!("accept error = {:?}", e);
+                        continue;
+                    }
+                    Ok(Ok((stream, _addr))) => {
                         *state.lock().await = ServerState::Busy;
                         spawn_connection(pool.clone(), stream, stop_word.clone()).await?;
-                    },
-                    Err(ref err) => { println!("accept error = {:?}", err); }
+                    }
                 }
             }
         }
@@ -170,7 +179,7 @@ impl Server {
     }
 }
 
-pub fn start_server(config: Config) -> Result<(Arc<Mutex<ServerState>>, Arc<Notify>), Box<dyn std::error::Error>> {
+pub(crate) fn start_server(config: Config) -> Result<(Arc<Mutex<ServerState>>, Arc<Notify>), Box<dyn std::error::Error>> {
     let state = Arc::new(Mutex::new(ServerState::Init));
     let socket_addr = Addr::new(config.server_addr.to_owned(), config.server_port.to_owned());
     let stop_word = Arc::new(Notify::new());

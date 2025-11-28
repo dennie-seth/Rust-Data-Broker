@@ -1,5 +1,6 @@
 mod net;
 mod config;
+mod tests;
 
 use std::io::BufRead;
 use std::path::PathBuf;
