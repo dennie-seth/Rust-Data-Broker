@@ -92,7 +92,7 @@ impl Notify {
 }
 #[repr(u8)]
 #[derive(Debug, Clone)]
-enum Request {
+pub(crate) enum Request {
     Enqueue = 1,
     Dequeue = 2,
 }
@@ -107,7 +107,7 @@ impl Request {
 }
 #[repr(u8)]
 #[derive(Debug, Clone)]
-enum Response {
+pub(crate) enum Response {
     Succeeded = 1,
     Failed = 2,
 }
@@ -137,10 +137,11 @@ impl BrokerClient {
             payload_queue: Arc::new(Mutex::new(VecDeque::new())),
         }
     }
-    pub(crate) async fn enqueue(&mut self, message: &RequestMessage) {
+    pub(crate) async fn enqueue(&mut self, message: &RequestMessage) -> Result<(), std::io::Error> {
         self.payload_queue.lock().await.push_back(message.clone());
         println!("[worker {:?}] enqueued a message of size {:?}",
                  std::thread::current().id(), message.payload_size);
+        Ok(())
     }
     pub(crate) async fn dequeue(&mut self) -> Result<RequestMessage, std::io::Error> {
         let message = self.payload_queue.lock().await.pop_front();
@@ -208,6 +209,8 @@ async fn send_message(stream: Arc<Mutex<TcpStream>>, broker_client: Arc<Mutex<Br
         stream.lock().await.write_all(&message.to_u8()).await?;
         return Ok(());
     }
+    let message = ResponseMessage::new(Response::Failed, vec!());
+    stream.lock().await.write_all(&message.to_u8()).await?;
     Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "no message to dequeue"))
 }
 async fn read_buffer(stream: Arc<Mutex<TcpStream>>, broker_client: Arc<Mutex<BrokerClient>>, stop_word: Arc<Notify>) -> Result<(), std::io::Error>
@@ -227,16 +230,21 @@ async fn read_buffer(stream: Arc<Mutex<TcpStream>>, broker_client: Arc<Mutex<Bro
                     tokio::spawn(async move {
                         match parse_message(&mut buffer).await {
                             Ok(message) => {
-                                broker_client.lock().await.enqueue(&message).await;
-                                let response = ResponseMessage::new(Response::Succeeded, vec!());
-                                match stream.lock().await.write_all(&response.to_u8()).await {
-                                    Ok(_) => (),
+                                match broker_client.lock().await.enqueue(&message).await {
+                                    Ok(_) => {
+                                        let response = ResponseMessage::new(Response::Succeeded, vec!());
+                                        send_response(&stream, &response).await;
+                                    },
                                     Err(err) => {
-                                        println!("[worker {:?}] response error {:?}", std::thread::current().id(), err);
-                                    }
+                                        let response = ResponseMessage::new(Response::Failed, vec!());
+                                        send_response(&stream, &response).await;
+                                        println!("[worker {:?}] enqueue error: {:?}", std::thread::current().id(), err);
+                                    },
                                 }
                             },
                             Err(err) => {
+                                let response = ResponseMessage::new(Response::Failed, vec!());
+                                send_response(&stream, &response).await;
                                 println!("[worker {:?}] parse_message error {:?}", std::thread::current().id(), err);
                             }
                         }
@@ -259,6 +267,16 @@ async fn read_buffer(stream: Arc<Mutex<TcpStream>>, broker_client: Arc<Mutex<Bro
     }
     Ok(())
 }
+
+async fn send_response(stream: &Arc<Mutex<TcpStream>>, response: &ResponseMessage) {
+    match stream.lock().await.write_all(&response.to_u8()).await {
+        Ok(_) => (),
+        Err(err) => {
+            println!("[worker {:?}] response error {:?}", std::thread::current().id(), err);
+        }
+    }
+}
+
 async fn handle_connection(stream: TcpStream, broker_client: Arc<Mutex<BrokerClient>>, stop_word: Arc<Notify>) {
     let peer_addr = stream.peer_addr().unwrap();
     println!("New connection from {peer_addr}");
@@ -298,7 +316,7 @@ impl Server {
         {
             *state.lock().await = ServerState::Waiting;
             loop {
-                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                tokio::time::sleep(Duration::from_millis(10)).await;
                 if stop_word.notified() {
                     *state.lock().await = ServerState::Stopped;
                     break;
@@ -306,7 +324,7 @@ impl Server {
 
                 let accept_result =
                     tokio::time::timeout(
-                        tokio::time::Duration::from_millis(50),
+                        Duration::from_millis(50),
                         listener.accept(),
                     ).await;
                 match accept_result {
