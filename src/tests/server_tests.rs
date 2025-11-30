@@ -132,7 +132,9 @@ mod tests {
         wait_for_state(state.clone(), ServerState::Waiting, Duration::from_secs(1)).await;
 
         let mut client = TcpStream::connect(address).await.unwrap();
-        client.write_all(b"hello world").await.unwrap();
+        let payload = b"hello world".to_vec();
+        let msg_bytes = encode_request(1u8, &payload); // 1 == Request::Enqueue
+        client.write_all(&msg_bytes).await.unwrap();
 
         wait_for_state(state.clone(), ServerState::Busy, Duration::from_secs(1)).await;
         stop_word.notify();
@@ -152,9 +154,11 @@ mod tests {
         let (state, stop_word) = start_server(config).unwrap();
         wait_for_state(state.clone(), ServerState::Waiting, Duration::from_secs(1)).await;
 
-        for _ in 0..3 {
+        for i in 0..3 {
             let mut client = TcpStream::connect(address).await.unwrap();
-            client.write_all(b"hello world").await.unwrap();
+            let payload = format!("msg-{i}").into_bytes();
+            let msg_bytes = encode_request(1u8, &payload); // ENQUEUE
+            client.write_all(&msg_bytes).await.unwrap();
             tokio::time::sleep(Duration::from_millis(30)).await;
         }
 
@@ -163,4 +167,13 @@ mod tests {
         stop_word.notify();
         wait_for_state(state.clone(), ServerState::Stopped, Duration::from_secs(1)).await;
     }
+    fn encode_request(command: u8, payload: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(1 + 8 + payload.len());
+        buf.push(command);
+        let len = payload.len() as u64;
+        buf.extend_from_slice(&len.to_be_bytes());
+        buf.extend_from_slice(payload);
+        buf
+    }
+
 }

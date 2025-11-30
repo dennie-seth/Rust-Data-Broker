@@ -155,24 +155,24 @@ impl BrokerClient {
 #[derive(Debug, Clone)]
 pub(crate) struct RequestMessage {
     command: Request,
-    payload_size: usize,
+    payload_size: u64,
     payload: Vec<u8>,
 }
 impl RequestMessage {
     pub(crate) fn new(bytes: BytesMut) -> Self {
         Self {
             command: Request::from_u8(bytes[0]),
-            payload_size: bytes[1] as usize,
-            payload: bytes[2..].to_vec(),
+            payload_size: u64::from_be_bytes(bytes[1..9].try_into().unwrap()),
+            payload: bytes[9..].to_vec(),
         }
     }
 }
-async fn parse_message(buffer: &mut BytesMut) -> Result<(RequestMessage), std::io::Error> {
+async fn parse_message(buffer: &mut BytesMut) -> Result<RequestMessage, std::io::Error> {
     let message;
     loop {
-        let payload_size = buffer[1];
-        if buffer.len() >= payload_size as usize + 2 {
-            message = RequestMessage::new(buffer.split_to(payload_size as usize + 2));
+        let payload_size = u64::from_be_bytes(buffer[1..9].try_into().unwrap());
+        if buffer.len() >= payload_size as usize + 9 {
+            message = RequestMessage::new(buffer.split_to(payload_size as usize + 9));
             break;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -187,7 +187,7 @@ async fn read_buffer(stream: Arc<Mutex<TcpStream>>, broker_client: Arc<Mutex<Bro
             break;
         }
         stream.lock().await.read_buf(&mut buffer).await?;
-        if buffer.len() >= 2 {
+        if buffer.len() >= 9 {
             match Request::from_u8(buffer[0]) {
                 Request::Enqueue | Request::Dequeue => {
                     let mut buffer = buffer.clone();
