@@ -46,7 +46,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 #[cfg(unix)]
                 ShutdownReason::SigTerm => {
                     println!("SigTerm received, shutting down...");
-                    stop_word.notify();
+                    thread_stop_word.notify();
                 }
                 #[cfg(unix)]
                 ShutdownReason::SigHup => {
