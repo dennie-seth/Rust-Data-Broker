@@ -175,11 +175,11 @@ pub(crate) struct ResponseMessage {
     payload: Vec<u8>,
 }
 impl ResponseMessage {
-    pub(crate) fn new(status: Response, bytes: Vec<u8>) -> Self {
+    pub(crate) fn new(status: Response, payload: Vec<u8>) -> Self {
         Self {
             status,
-            payload_size: bytes.len() as u64,
-            payload: bytes,
+            payload_size: payload.len() as u64,
+            payload
         }
     }
     pub(crate) fn to_u8(&self) -> Vec<u8> {

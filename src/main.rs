@@ -4,6 +4,8 @@ mod tests;
 
 use std::io::BufRead;
 use std::thread;
+use std::thread::sleep;
+use std::time::Duration;
 use tokio::signal;
 use crate::config::parse_config;
 use crate::net::server::start_server;
@@ -32,14 +34,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // endregion
     
     // region: main app loop
-    {
-        let stop_word = stop_word.clone();
+    loop {
+        let thread_stop_word = stop_word.clone();
         tokio::spawn(async move {
             let reason = wait_for_shutdown().await;
             match reason {
                 ShutdownReason::CtrlC => {
                     println!("Shutting down...");
-                    stop_word.notify();
+                    thread_stop_word.notify();
                 }
                 #[cfg(unix)]
                 ShutdownReason::SigTerm => {
@@ -51,7 +53,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     println!("SigHup received, not implemented");
                 }
             }
-        });
+        }).await?;
+        if stop_word.notified() {
+            break;
+        }
     }
     // endregion
     Ok(())
