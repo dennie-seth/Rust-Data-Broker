@@ -25,11 +25,13 @@ cargo test <test_name>
 
 **Configuration:** Pass `--config=<path>` to specify the settings file. Without the flag, it looks for `.settings` in the current working directory.
 
+**Graceful shutdown (Linux only):** Pass `--shutdown_timeout=<secs>` to enable drain-and-wait on SIGTERM. Value `0` is treated as 30 seconds. Without the flag, SIGTERM stops immediately (same as Ctrl+C).
+
 ## Architecture
 
 ### Threading Model
 
-- **Main thread**: Tokio multi-threaded runtime; handles graceful shutdown (Ctrl+C / SIGTERM)
+- **Main thread**: Tokio multi-threaded runtime; handles graceful shutdown (Ctrl+C / SIGTERM). Two notifies control shutdown: `stop_accepting` (stop taking new connections) and `stop_word` (stop all active connections). A third notify, `drained`, is fired by `Server::run` once `active_connections` reaches zero.
 - **Worker pool** (`Pool` in `src/net/server.rs`): N OS threads, each running a single-threaded Tokio runtime; jobs are dispatched via `std::sync::mpsc::sync_channel` to the least-loaded worker (pressure-based, tracked with `AtomicUsize` per worker)
 - **Per-connection tasks**: Spawned via `tokio::spawn` inside worker threads
 

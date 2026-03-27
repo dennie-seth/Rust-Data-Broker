@@ -114,7 +114,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn server_accepts_connection() {
         let address = free_local_addr();
-        let stop_word = start_server(make_config(address)).unwrap();
+        let drained = Arc::new(Notify::new());
+        let (stop_word, _) = start_server(make_config(address), drained).unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         TcpStream::connect(address).await.unwrap();
@@ -125,7 +126,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn server_enqueue_responds_success() {
         let address = free_local_addr();
-        let stop_word = start_server(make_config(address)).unwrap();
+        let drained = Arc::new(Notify::new());
+        let (stop_word, _) = start_server(make_config(address), drained).unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         let mut client = TcpStream::connect(address).await.unwrap();
@@ -142,7 +144,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn server_dequeue_empty_responds_failure() {
         let address = free_local_addr();
-        let stop_word = start_server(make_config(address)).unwrap();
+        let drained = Arc::new(Notify::new());
+        let (stop_word, _) = start_server(make_config(address), drained).unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         let mut client = TcpStream::connect(address).await.unwrap();
@@ -159,7 +162,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn server_enqueue_then_dequeue_returns_message() {
         let address = free_local_addr();
-        let stop_word = start_server(make_config(address)).unwrap();
+        let drained = Arc::new(Notify::new());
+        let (stop_word, _) = start_server(make_config(address), drained).unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         let mut client = TcpStream::connect(address).await.unwrap();
@@ -187,7 +191,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn server_accepts_multiple_clients() {
         let address = free_local_addr();
-        let stop_word = start_server(make_config(address)).unwrap();
+        let drained = Arc::new(Notify::new());
+        let (stop_word, _) = start_server(make_config(address), drained).unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         let mut handles = vec![];

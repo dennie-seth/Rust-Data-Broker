@@ -3,9 +3,10 @@ mod config;
 mod tests;
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use tokio::signal;
 use crate::config::parse_config;
-use crate::net::server::start_server;
+use crate::net::server::{start_server, Notify};
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -33,7 +34,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // endregion
 
     // region: server launch
-    let stop_word = start_server(config)?;
+    let drained = Arc::new(Notify::new());
+    let (stop_word, stop_accepting) = start_server(config, drained.clone())?;
     // endregion
 
     // region: main app loop
@@ -45,11 +47,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ShutdownReason::CtrlC => {
                         println!("Shutting down...");
                         stop_word.notify();
+                        stop_accepting.notify();
                     }
                     #[cfg(unix)]
                     ShutdownReason::SigTerm => {
-                        println!("SigTerm received, shutting down...");
-                        stop_word.notify();
+                        println!("SigTerm received, gracefully shutting down...");
+                        stop_accepting.notify();
+                        if env_args.contains_key("--shutdown_timeout") {
+                            let mut duration = env_args.get("--shutdown_timeout").unwrap().parse::<u64>()?;
+                            if duration == 0 {
+                                duration = 30;
+                            }
+                            timeout(Duration::from_secs(duration), drained.notified()).await.
+                                        unwrap_or_else(|_| {
+                                            println!("Shutdown timed out!");
+                                            stop_word.notify();
+                                    });
+                            stop_word.notify();
+                        }
+                        else {
+                            // No timeout specified — stop immediately without waiting for drain.
+                            stop_word.notify();
+                        }
                     }
                     #[cfg(unix)]
                     ShutdownReason::SigHup => {

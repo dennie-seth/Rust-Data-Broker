@@ -5,6 +5,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize};
 use std::sync::atomic::Ordering::Relaxed;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex};
@@ -137,6 +138,8 @@ pub(crate) struct Server {
     // any client can enqueue into and any other client can dequeue from.
     clients: Arc<Mutex<HashMap<SocketAddr, BrokerClient>>>,
     stop_word: Arc<Notify>,
+    stop_accepting: Arc<Notify>,
+    active_connections: Arc<AtomicUsize>,
 }
 #[derive(Debug, Clone)]
 pub(crate) struct BrokerClient {
@@ -215,7 +218,6 @@ async fn read_buffer(stream: TcpStream, broker_client: Arc<Mutex<BrokerClient>>,
     let (mut stream_read, stream_write) = stream.into_split();
     let stream_write = Arc::new(Mutex::new(stream_write));
 
-
     loop {
         tokio::select! {
             _ = stop_word.notified() => { break; },
@@ -292,14 +294,16 @@ async fn send_response(stream: Arc<Mutex<OwnedWriteHalf>>, response: &ResponseMe
 }
 
 impl Server {
-    fn new(addr: Addr, stop_word: Arc<Notify>) -> Self {
+    fn new(addr: Addr, stop_word: Arc<Notify>, stop_accepting: Arc<Notify>) -> Self {
         Self {
             addr,
             clients: Arc::new(Mutex::new(HashMap::new())),
             stop_word,
+            stop_accepting,
+            active_connections: Arc::new(AtomicUsize::new(0_usize)),
         }
     }
-    pub(crate) async fn run(&mut self, config: Config) -> Result<(), std::io::Error> {
+    pub(crate) async fn run(&mut self, config: Config, drained: &Arc<Notify>) -> Result<(), std::io::Error> {
         let listener = TcpListener::bind(&self.addr.addr).await?;
         let stop_word = self.stop_word.clone();
         let pool = Arc::new(Pool::new(
@@ -308,7 +312,7 @@ impl Server {
         {
             loop {
                 tokio::select! {
-                    _ = stop_word.notified() => { break; },
+                    _ = self.stop_accepting.notified() => { break; },
                     accept_result = listener.accept() => {
                         match accept_result {
                             Ok((stream, client_addr)) => {
@@ -330,6 +334,11 @@ impl Server {
                         }},
                 }
             }
+            loop {
+                if self.active_connections.load(Relaxed) == 0 { break; }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            drained.notify();
         }
         Ok(())
     }
@@ -338,27 +347,30 @@ impl Server {
     // per-connection buffer, not a message broker. For real pub/sub or work-queue semantics you need
     // a shared global queue (or named topic map) that is independent of individual connections.
     async fn handle_connection(self, stream: TcpStream, broker_client: Arc<Mutex<BrokerClient>>, stop_word: Arc<Notify>, addr: SocketAddr) {
+        self.active_connections.fetch_add(1, Relaxed);
         if let Err(err) = read_buffer(stream, broker_client.clone(), stop_word.clone()).await {
             println!("[worker {:?}] read_buffer error {:?}", std::thread::current().id(), err);
         }
         self.clients.lock().await.remove(&addr);
+        self.active_connections.fetch_sub(1, Relaxed);
     }
     async fn spawn_connection(self, pool: Arc<Pool>, socket: TcpStream, broker_client: Arc<Mutex<BrokerClient>>, stop_word: Arc<Notify>, addr: SocketAddr) -> Result<(), std::io::Error>{
         println!("New connection from {}", addr);
         pool.spawn(async move { self.handle_connection(socket, broker_client, stop_word.clone(), addr).await }).await
     }
 }
-pub(crate) fn start_server(config: Config) -> Result<Arc<Notify>, Box<dyn std::error::Error>> {
+pub(crate) fn start_server(config: Config, drained: Arc<Notify>) -> Result<(Arc<Notify>, Arc<Notify>), Box<dyn std::error::Error>> {
     let socket_addr = Addr::new(config.server_addr.to_owned(), config.server_port.to_owned());
     let stop_word = Arc::new(Notify::new());
-    let mut server = Server::new(socket_addr?, stop_word.clone());
+    let stop_accepting = Arc::new(Notify::new());
+    let mut server = Server::new(socket_addr?, stop_word.clone(), stop_accepting.clone());
     
     tokio::spawn(async move {
-        let result = server.run(config).await;
+        let result = server.run(config, &drained).await;
         if result.is_err() {
             println!("Server stopped with error: {:?}", result.err().unwrap());
             return;
         }
     });
-    Ok(stop_word)
+    Ok((stop_word, stop_accepting))
 }
