@@ -1,4 +1,5 @@
 use std::collections::{HashMap, VecDeque};
+use std::io;
 use std::net::{SocketAddr, SocketAddrV4};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -58,16 +59,12 @@ impl Pool {
 
         self.pressure[worker_id].fetch_add(1, Relaxed);
 
-        // TODO(bug): if worker_id is not in map the job is silently dropped — pressure was
-        // already incremented but never decremented, permanently skewing future dispatch.
-        // Use map.get(...).ok_or(...)?  to return an error instead of silently losing the job.
-        if let Some(sender) = self.map.get(&worker_id) {
-            let sender = sender.clone();
-            let job = Box::pin(future) as Job;
-            tokio::task::spawn_blocking(move || sender.send(job)).await.
-                map_err(|_| std::io::ErrorKind::BrokenPipe)?.
-                map_err(|_| std::io::ErrorKind::Other)?;
-        }
+        let sender = self.map.get(&worker_id).ok_or_else(|| { self.pressure[worker_id].fetch_sub(1, Relaxed); io::Error::new(io::ErrorKind::BrokenPipe, "worker not found") } )?;
+        let sender = sender.clone();
+        let job = Box::pin(future) as Job;
+        tokio::task::spawn_blocking( move | | sender.send(job)).await.
+        map_err( | _ | std::io::ErrorKind::BrokenPipe) ?.
+        map_err( | _ | std::io::ErrorKind::Other) ?;
         Ok(())
     }
 }
@@ -169,14 +166,16 @@ impl BrokerClient {
 }
 #[derive(Debug, Clone)]
 pub(crate) struct RequestMessage {
+    // TODO(cleanup): command is stored but never read after construction. Remove the field
+    // or use it (e.g. for logging which command a queued message originated from).
     command: Request,
     payload_size: u64,
     payload: Vec<u8>,
 }
 impl RequestMessage {
-    pub(crate) fn new(bytes: BytesMut) -> Result<Self, std::io::Error> {
+    pub(crate) fn new(command: &Request, bytes: BytesMut) -> Result<Self, std::io::Error> {
         Ok(Self {
-            command: Request::from_u8(bytes[0])?,
+            command:  command.to_owned(),
             payload_size: u64::from_be_bytes(bytes[1..9].try_into().unwrap()),
             payload: bytes[9..].to_vec(),
         })
@@ -231,9 +230,7 @@ async fn read_buffer(stream: TcpStream, broker_client: Arc<Mutex<BrokerClient>>,
                 continue;
             }
             let command = Request::from_u8(buffer[0])?;
-            // TODO(suggestion): from_u8 is called twice on the same byte — once above for the
-            // match, and again inside RequestMessage::new. Parse once and pass the result in.
-            let message = RequestMessage::new(buffer.split_to(9 + payload_size as usize));
+            let message = RequestMessage::new(&command, buffer.split_to(9 + payload_size as usize));
 
             match command{
                 Request::Enqueue => {
@@ -269,9 +266,11 @@ async fn read_buffer(stream: TcpStream, broker_client: Arc<Mutex<BrokerClient>>,
                     let writer = stream_write.clone();
 
                     tokio::spawn(async move {
-                        match send_message(writer, broker_client).await {
+                        match send_message(writer.clone(), broker_client).await {
                             Ok(_) => {},
                             Err(err) => {
+                                let response = ResponseMessage::new(Response::Failed, vec!());
+                                send_response(writer, &response).await;
                                 println!("[worker {:?}] send_message error {:?}", std::thread::current().id(), err);
                             }
                         }
@@ -315,9 +314,17 @@ impl Server {
                             Ok((stream, client_addr)) => {
                                 let broker_client = Arc::new(Mutex::new(BrokerClient::new()));
                                 self.clients.lock().await.insert(client_addr, broker_client.lock().await.clone());
-                                // TODO(bug): errors from spawn_connection (e.g. pool channel full)
-                                // are silently discarded. Log or propagate the JoinHandle result.
-                                _ = tokio::spawn(self.clone().spawn_connection(pool.clone(), stream, broker_client, stop_word.clone(), client_addr));
+                                let server = self.clone();
+                                let pool = pool.clone();
+                                let stop_word = stop_word.clone();
+                                tokio::spawn(async move{
+                                    match server.spawn_connection(pool, stream, broker_client, stop_word.clone(), client_addr).await {
+                                        Ok(_) => {},
+                                        Err(err) => {
+                                            println!("[worker {:?}] spawn_connection error {:?}", std::thread::current().id(), err);
+                                        }
+                                    }
+                                });
                             },
                             Err(err) => { println!("[worker {:?}] error {:?}", std::thread::current().id(), err); },
                         }},

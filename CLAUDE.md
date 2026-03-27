@@ -23,14 +23,14 @@ cargo test
 cargo test <test_name>
 ```
 
-**Configuration:** The `.settings` file must be placed next to the executable. For `cargo run`, copy `configs/.settings` to `target/debug/.settings`.
+**Configuration:** Pass `--config=<path>` to specify the settings file. Without the flag, it looks for `.settings` in the current working directory.
 
 ## Architecture
 
 ### Threading Model
 
 - **Main thread**: Tokio multi-threaded runtime; handles graceful shutdown (Ctrl+C / SIGTERM)
-- **Worker pool** (`Pool` in `src/net/server.rs`): N OS threads, each running a single-threaded Tokio runtime; jobs are dispatched via `std::sync::mpsc::sync_channel` with round-robin
+- **Worker pool** (`Pool` in `src/net/server.rs`): N OS threads, each running a single-threaded Tokio runtime; jobs are dispatched via `std::sync::mpsc::sync_channel` to the least-loaded worker (pressure-based, tracked with `AtomicUsize` per worker)
 - **Per-connection tasks**: Spawned via `tokio::spawn` inside worker threads
 
 ### Message Protocol (binary, big-endian)
@@ -47,7 +47,7 @@ cargo test <test_name>
 |------|------|---------|
 | `Config` | `src/config.rs` | Parsed from `.settings` (key=value, regex-based) |
 | `Server` | `src/net/server.rs` | TCP listener; accepts connections and hands to `Pool` |
-| `Pool` | `src/net/server.rs` | Worker thread pool with round-robin dispatch |
+| `Pool` | `src/net/server.rs` | Worker thread pool with pressure-based dispatch |
 | `BrokerClient` | `src/net/server.rs` | Per-connection `VecDeque` queue (not shared across clients) |
 
 ### Config Fields
@@ -63,8 +63,5 @@ cargo test <test_name>
 ### Known Design Limitations (intentional, for learning)
 
 - Each connection has an **isolated queue** — no inter-client message sharing (not a true broker)
-- `parse_message()` clones the buffer but never clears the original, causing frame misalignment on multiple messages
-- `Server` state transitions to `Busy` on first connection but never resets to `Waiting`
-- `clients` HashMap grows unbounded (entries never removed on disconnect)
-- `Request::from_u8()` / `Response::from_u8()` panic on unknown bytes instead of returning errors
-- The stdin reader thread is spawned but never reads input
+- `clients` map is write-only — entries are removed on disconnect but nothing reads the map to route messages between clients
+- `command` field in `RequestMessage` is stored but never read after construction

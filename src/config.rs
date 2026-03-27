@@ -14,7 +14,7 @@ pub struct Config
 static RE: OnceLock<Regex> = OnceLock::new();
 pub(crate) fn parse_config(path: &str) -> Result<Config ,Box<dyn std::error::Error>> {
     let config_file = fs::read_to_string(path);
-    (match config_file {
+    match config_file {
         Ok(_) => {
             let re = RE.get_or_init(|| Regex::new(r#"(\w+)\s*=\s*(?:"([^"]+)"|(\S+))"#).unwrap());
             let mut data: HashMap<String, String> = HashMap::new();
@@ -38,11 +38,8 @@ pub(crate) fn parse_config(path: &str) -> Result<Config ,Box<dyn std::error::Err
             // endregion
             Ok(config)
         },
-        // TODO(bug): All errors (permissions, I/O failures, etc.) are silently discarded and
-        // replaced with a generic "Config file not found" error. Match on ErrorKind::NotFound
-        // for the missing-file case and propagate all other errors with `?`.
         Err(err) => {
             Err(Box::new(err))
         }
-    })
+    }
 }

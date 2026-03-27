@@ -1,65 +1,76 @@
-﻿#[cfg(test)]
+#[cfg(test)]
 mod tests {
-    use std::mem::discriminant;
     use std::net::{Ipv4Addr, SocketAddrV4};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
-    use tokio::io::AsyncWriteExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
-    use tokio::sync::Mutex;
     use tokio::time::timeout;
     use crate::config::Config;
-    use crate::net::server::{start_server, Notify, Pool, ServerState};
+    use crate::net::server::{start_server, Notify, Pool};
 
-    async fn wait_for_state(state: Arc<Mutex<ServerState>>,
-        expected: ServerState,
-        max_wait: Duration) {
-        let _ = timeout(max_wait, async {
-            loop {
-                let state = state.lock().await.clone();
-                if discriminant(&state) == discriminant(&expected) {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        }).
-            await.
-            expect("timed out waiting for server state");
-    }
     fn free_local_addr() -> SocketAddrV4 {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         SocketAddrV4::new(Ipv4Addr::LOCALHOST, address.port())
     }
 
-    #[test]
-    fn notify_set_flag() {
-        let notify = Notify::new();
-        assert!(!notify.notified());
-        notify.notify();
-        assert!(notify.notified());
+    fn make_config(address: SocketAddrV4) -> Config {
+        Config {
+            threads_limit: 2,
+            proc_limit: 1,
+            wait_limit: 8,
+            server_addr: address.ip().to_string(),
+            server_port: address.port().to_string(),
+        }
     }
-    #[tokio::test]
-    async fn notify_is_visible_across_tasks() {
-        let notify = Arc::new(Notify::new());
-        let task_notify = notify.clone();
-        let waiter = tokio::spawn(async move {
-            for _ in 0..10 {
-                if task_notify.notified() {
-                    return true;
-                }
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-            false
-        });
 
+    fn encode_request(command: u8, payload: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(1 + 8 + payload.len());
+        buf.push(command);
+        buf.extend_from_slice(&(payload.len() as u64).to_be_bytes());
+        buf.extend_from_slice(payload);
+        buf
+    }
+
+    // --- Notify tests ---
+
+    #[tokio::test]
+    async fn notify_wakes_waiter() {
+        let notify = Arc::new(Notify::new());
+        let n = notify.clone();
+        // Waiter must be registered before notify() is called,
+        // since notify_waiters() only wakes *current* waiters.
+        let waiter = tokio::spawn(async move {
+            n.notified().await;
+            true
+        });
         tokio::time::sleep(Duration::from_millis(10)).await;
         notify.notify();
-
-        let result = waiter.await.unwrap();
-        assert!(result, "notify() wasn't observed from another task");
+        let result = timeout(Duration::from_secs(1), waiter)
+            .await.expect("timed out").unwrap();
+        assert!(result);
     }
+
+    #[tokio::test]
+    async fn notify_wakes_multiple_waiters() {
+        let notify = Arc::new(Notify::new());
+        let mut handles = vec![];
+        for _ in 0..3 {
+            let n = notify.clone();
+            handles.push(tokio::spawn(async move { n.notified().await }));
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        notify.notify();
+        for h in handles {
+            timeout(Duration::from_secs(1), h)
+                .await.expect("timed out").unwrap();
+        }
+    }
+
+    // --- Pool tests ---
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn pool_executes_job() {
         let pool = Pool::new(2, 8).unwrap();
@@ -68,112 +79,131 @@ mod tests {
         for _ in 0..10 {
             let counter = counter.clone();
             pool.spawn(async move {
-                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                counter.fetch_add(1, Ordering::SeqCst);
             }).await.unwrap();
         }
-        let _ = timeout(Duration::from_secs(1), async {
+        timeout(Duration::from_secs(1), async {
             loop {
-                if counter.load(Ordering::SeqCst) == 10 {
-                    break;
-                }
+                if counter.load(Ordering::SeqCst) == 10 { break; }
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
-        }).await.expect("timed out waiting for server executes job");
+        }).await.expect("timed out waiting for jobs to complete");
     }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn pool_round_robin() {
+    async fn pool_dispatches_all_jobs() {
         let pool = Pool::new(3, 4).unwrap();
         let counter = Arc::new(AtomicUsize::new(0));
 
         for _ in 0..30 {
             let counter = counter.clone();
             pool.spawn(async move {
-                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                counter.fetch_add(1, Ordering::SeqCst);
             }).await.unwrap();
         }
-
-        let _ = timeout(Duration::from_secs(2), async {
+        timeout(Duration::from_secs(2), async {
             loop {
-                if counter.load(Ordering::SeqCst) == 30 {
-                    break;
-                }
+                if counter.load(Ordering::SeqCst) == 30 { break; }
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
-        }).await.expect("timed out waiting for server executes job");
+        }).await.expect("timed out waiting for jobs to complete");
     }
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn server_transitions_without_clients() {
-        let address = free_local_addr();
-        let config = Config {
-            threads_limit: 1,
-            proc_limit: 1,
-            wait_limit: 8,
-            server_addr: address.ip().to_string(),
-            server_port: address.port().to_string(),
-        };
 
-        let (state, stop_word) = start_server(config).unwrap();
-        wait_for_state(state.clone(), ServerState::Waiting, Duration::from_secs(1)).await;
+    // --- Server tests ---
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn server_accepts_connection() {
+        let address = free_local_addr();
+        let stop_word = start_server(make_config(address)).unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        TcpStream::connect(address).await.unwrap();
+
         stop_word.notify();
-        wait_for_state(state.clone(), ServerState::Stopped, Duration::from_secs(1)).await;
     }
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn server_transitions_with_clients() {
-        let address = free_local_addr();
-        let config = Config {
-            threads_limit: 1,
-            proc_limit: 1,
-            wait_limit: 8,
-            server_addr: address.ip().to_string(),
-            server_port: address.port().to_string(),
-        };
 
-        let (state, stop_word) = start_server(config).unwrap();
-        wait_for_state(state.clone(), ServerState::Waiting, Duration::from_secs(1)).await;
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn server_enqueue_responds_success() {
+        let address = free_local_addr();
+        let stop_word = start_server(make_config(address)).unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
 
         let mut client = TcpStream::connect(address).await.unwrap();
-        let payload = b"hello world".to_vec();
-        let msg_bytes = encode_request(1u8, &payload); // 1 == Request::Enqueue
-        client.write_all(&msg_bytes).await.unwrap();
+        client.write_all(&encode_request(1, b"hello world")).await.unwrap();
 
-        wait_for_state(state.clone(), ServerState::Busy, Duration::from_secs(1)).await;
+        let mut response = [0u8; 9];
+        timeout(Duration::from_secs(1), client.read_exact(&mut response))
+            .await.expect("timed out reading response").unwrap();
+        assert_eq!(response[0], 1, "expected Succeeded (1)");
+
         stop_word.notify();
-        wait_for_state(state.clone(), ServerState::Stopped, Duration::from_secs(1)).await;
     }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn server_accepts_multiple_clients_sequentially() {
+    async fn server_dequeue_empty_responds_failure() {
         let address = free_local_addr();
-        let config = Config {
-            threads_limit: 1,
-            proc_limit: 1,
-            wait_limit: 8,
-            server_addr: address.ip().to_string(),
-            server_port: address.port().to_string(),
-        };
+        let stop_word = start_server(make_config(address)).unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
 
-        let (state, stop_word) = start_server(config).unwrap();
-        wait_for_state(state.clone(), ServerState::Waiting, Duration::from_secs(1)).await;
+        let mut client = TcpStream::connect(address).await.unwrap();
+        client.write_all(&encode_request(2, b"")).await.unwrap();
 
-        for i in 0..3 {
-            let mut client = TcpStream::connect(address).await.unwrap();
-            let payload = format!("msg-{i}").into_bytes();
-            let msg_bytes = encode_request(1u8, &payload); // ENQUEUE
-            client.write_all(&msg_bytes).await.unwrap();
-            tokio::time::sleep(Duration::from_millis(30)).await;
-        }
+        let mut response = [0u8; 9];
+        timeout(Duration::from_secs(1), client.read_exact(&mut response))
+            .await.expect("timed out reading response").unwrap();
+        assert_eq!(response[0], 2, "expected Failed (2)");
 
-        let state_current = state.lock().await.clone();
-        assert!(matches!(state_current, ServerState::Busy | ServerState::Waiting));
         stop_word.notify();
-        wait_for_state(state.clone(), ServerState::Stopped, Duration::from_secs(1)).await;
-    }
-    fn encode_request(command: u8, payload: &[u8]) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(1 + 8 + payload.len());
-        buf.push(command);
-        let len = payload.len() as u64;
-        buf.extend_from_slice(&len.to_be_bytes());
-        buf.extend_from_slice(payload);
-        buf
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn server_enqueue_then_dequeue_returns_message() {
+        let address = free_local_addr();
+        let stop_word = start_server(make_config(address)).unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut client = TcpStream::connect(address).await.unwrap();
+        let payload = b"hello world";
+
+        // Enqueue
+        client.write_all(&encode_request(1, payload)).await.unwrap();
+        let mut response = [0u8; 9];
+        timeout(Duration::from_secs(1), client.read_exact(&mut response))
+            .await.expect("timed out on enqueue response").unwrap();
+        assert_eq!(response[0], 1, "enqueue: expected Succeeded");
+
+        // Dequeue
+        client.write_all(&encode_request(2, b"")).await.unwrap();
+        let payload_size = payload.len() as u64;
+        let mut response = vec![0u8; 9 + payload_size as usize];
+        timeout(Duration::from_secs(1), client.read_exact(&mut response))
+            .await.expect("timed out on dequeue response").unwrap();
+        assert_eq!(response[0], 1, "dequeue: expected Succeeded");
+        assert_eq!(&response[9..], payload);
+
+        stop_word.notify();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn server_accepts_multiple_clients() {
+        let address = free_local_addr();
+        let stop_word = start_server(make_config(address)).unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut handles = vec![];
+        for i in 0..3u8 {
+            handles.push(tokio::spawn(async move {
+                let mut client = TcpStream::connect(address).await.unwrap();
+                let payload = vec![i; 4];
+                client.write_all(&encode_request(1, &payload)).await.unwrap();
+                let mut response = [0u8; 9];
+                timeout(Duration::from_secs(1), client.read_exact(&mut response))
+                    .await.expect("timed out").unwrap();
+                assert_eq!(response[0], 1);
+            }));
+        }
+        for h in handles { h.await.unwrap(); }
+
+        stop_word.notify();
+    }
 }
