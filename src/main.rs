@@ -24,8 +24,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config_path = std::path::PathBuf::from(env_args.get("--config").unwrap().to_string());
     }
     else {
-        // TODO(bug): parent() returns None at filesystem root, causing a panic. Use
-        // current_dir() directly (without .parent()) or require --config to be explicit.
         config_path = std::env::current_dir().unwrap().to_path_buf();
     }
     config_path = config_path.join(".settings");

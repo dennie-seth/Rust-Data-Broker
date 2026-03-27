@@ -2,10 +2,8 @@ use std::collections::{HashMap, VecDeque};
 use std::net::{SocketAddr, SocketAddrV4};
 use std::pin::Pin;
 use std::sync::Arc;
-// TODO(cleanup): AtomicBool is imported but unused since Notify was rewritten.
 use std::sync::atomic::{AtomicUsize};
 use std::sync::atomic::Ordering::Relaxed;
-use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex};
@@ -17,8 +15,6 @@ type Job = Pin<Box<dyn Future<Output = ()> + Send>>;
 #[derive(Debug)]
 pub(crate) struct Pool {
     map : HashMap<usize, std::sync::mpsc::SyncSender<Job>>,
-    // TODO(cleanup): next_worker and workers are unused since pressure-based dispatch replaced
-    // round-robin. Remove them (and the AtomicUsize/Ordering imports above).
     pressure: Vec<Arc<AtomicUsize>>,
 }
 impl Pool {
@@ -62,6 +58,9 @@ impl Pool {
 
         self.pressure[worker_id].fetch_add(1, Relaxed);
 
+        // TODO(bug): if worker_id is not in map the job is silently dropped — pressure was
+        // already incremented but never decremented, permanently skewing future dispatch.
+        // Use map.get(...).ok_or(...)?  to return an error instead of silently losing the job.
         if let Some(sender) = self.map.get(&worker_id) {
             let sender = sender.clone();
             let job = Box::pin(future) as Job;
@@ -110,8 +109,6 @@ pub(crate) enum Request {
     Dequeue = 2,
 }
 impl Request {
-    // TODO(bug): Unknown byte still hits `unimplemented!()` which panics and kills the worker
-    // thread. Replace with `Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "..."))`.
     pub(crate) fn from_u8(value: u8) -> Result<Self, std::io::Error> {
         match value {
             1 => Ok(Request::Enqueue),
@@ -127,7 +124,6 @@ pub(crate) enum Response {
     Failed = 2,
 }
 impl Response {
-    // TODO(bug): Same unimplemented!() panic as Request::from_u8. Return Err(...) instead.
     pub(crate) fn from_u8(value: u8) -> Result<Self, std::io::Error> {
         match value {
             1 => Ok(Response::Succeeded),
@@ -178,12 +174,12 @@ pub(crate) struct RequestMessage {
     payload: Vec<u8>,
 }
 impl RequestMessage {
-    pub(crate) fn new(bytes: BytesMut) -> Self {
-        Self {
-            command: Request::from_u8(bytes[0]).unwrap(),
+    pub(crate) fn new(bytes: BytesMut) -> Result<Self, std::io::Error> {
+        Ok(Self {
+            command: Request::from_u8(bytes[0])?,
             payload_size: u64::from_be_bytes(bytes[1..9].try_into().unwrap()),
             payload: bytes[9..].to_vec(),
-        }
+        })
     }
 }
 #[derive(Debug, Clone)]
@@ -208,29 +204,11 @@ impl ResponseMessage {
         bytes
     }
 }
-// TODO(bug): This function receives a *cloned* BytesMut (see read_buffer below). No new data
-// is ever written into that clone, so if the clone doesn't already hold the full message the
-// sleep(10ms) loop spins forever, leaking the spawned task.
-// Fix: do not clone the buffer. Instead, keep reading from the real stream until enough bytes
-// have arrived, then parse. The simplest approach is to read header (9 bytes) first, then read
-// exactly payload_size more bytes directly from the stream before constructing RequestMessage.
-//
-// TODO(bug): `buffer[1..9]` is accessed without first checking that buffer.len() >= 9.
-// If called with fewer than 9 bytes this panics. Add a guard:
-//   if buffer.len() < 9 { return Err(...); }
-// TODO(suggestion): This function duplicates the logic of BrokerClient::dequeue() by
-// directly accessing payload_queue instead of calling broker_client.lock().await.dequeue().
-// Consolidate into one code path to avoid diverging behaviour and missing log output.
 async fn send_message(stream: Arc<Mutex<OwnedWriteHalf>>, broker_client: Arc<Mutex<BrokerClient>>) -> Result<(), std::io::Error> {
     let message = broker_client.lock().await.dequeue().await?;
-    if message.payload_size > 0 {
-        let message = ResponseMessage::new(Response::Succeeded, message.payload);
-        stream.lock().await.write_all(&message.to_u8()).await?;
-        return Ok(());
-    }
-    let message = ResponseMessage::new(Response::Failed, vec!());
+    let message = ResponseMessage::new(Response::Succeeded, message.payload);
     stream.lock().await.write_all(&message.to_u8()).await?;
-    Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "no message to dequeue"))
+    Ok(())
 }
 async fn read_buffer(stream: TcpStream, broker_client: Arc<Mutex<BrokerClient>>, stop_word: Arc<Notify>) -> Result<(), std::io::Error>
 {
@@ -242,7 +220,9 @@ async fn read_buffer(stream: TcpStream, broker_client: Arc<Mutex<BrokerClient>>,
     loop {
         tokio::select! {
             _ = stop_word.notified() => { break; },
-            result = stream_read.read_buf(&mut buffer) => { result?; },
+            result = stream_read.read_buf(&mut buffer) => {
+                if result? == 0 { break; }
+            }
         }
 
         if buffer.len() >= 9 {
@@ -251,26 +231,26 @@ async fn read_buffer(stream: TcpStream, broker_client: Arc<Mutex<BrokerClient>>,
                 continue;
             }
             let command = Request::from_u8(buffer[0])?;
+            // TODO(suggestion): from_u8 is called twice on the same byte — once above for the
+            // match, and again inside RequestMessage::new. Parse once and pass the result in.
             let message = RequestMessage::new(buffer.split_to(9 + payload_size as usize));
 
             match command{
                 Request::Enqueue => {
-                    // TODO(bug): `buffer.clone()` creates a snapshot of the current bytes.
-                    // No further reads are written into this clone, so parse_message will spin
-                    // forever if the snapshot doesn't already hold the full payload.
-                    // Fix: remove the clone and parse directly from `buffer`, or restructure to
-                    // read from the stream until the full message is available before spawning.
-                    //
-                    // TODO(bug): The original `buffer` is never consumed (split_to is called
-                    // only on the clone). After this match arm, buffer still holds the same bytes,
-                    // so the next read_buf call appends to already-processed data, breaking framing.
-                    // Fix: call buffer.advance(n) or buffer.split_to(n) on the *original* buffer
-                    // once the full message has been identified.
-
                     let broker_client = broker_client.clone();
                     let writer = stream_write.clone();
 
                     tokio::spawn(async move {
+                        let message = match message
+                        {
+                            Ok(message) => message,
+                            Err(err) => {
+                                let response = ResponseMessage::new(Response::Failed, vec!());
+                                send_response(writer, &response).await;
+                                println!("[worker {:?}] parse_message error {:?}", std::thread::current().id(), err);
+                                return;
+                            }
+                        };
                         match broker_client.lock().await.enqueue(&message).await {
                             Ok(_) => {
                                 let response = ResponseMessage::new(Response::Succeeded, vec!());
@@ -279,7 +259,7 @@ async fn read_buffer(stream: TcpStream, broker_client: Arc<Mutex<BrokerClient>>,
                             Err(err) => {
                                 let response = ResponseMessage::new(Response::Failed, vec!());
                                 send_response(writer, &response).await;
-                                println!("[worker {:?}] parse_message error {:?}", std::thread::current().id(), err);
+                                println!("[worker {:?}] enqueue error {:?}", std::thread::current().id(), err);
                             }
                         }
                     });
@@ -328,29 +308,18 @@ impl Server {
             config.wait_limit as usize)?);
         {
             loop {
-                tokio::time::sleep(Duration::from_millis(10)).await;
                 tokio::select! {
                     _ = stop_word.notified() => { break; },
-                    accept_result = tokio::time::timeout(Duration::from_millis(50), listener.accept()) => {
+                    accept_result = listener.accept() => {
                         match accept_result {
-                            Err(_elapsed) => {
-                                continue;
-                            }
-                            Ok(Err(e)) => {
-                                println!("accept error = {:?}", e);
-                                continue;
-                            }
-                            Ok(Ok((stream, client_addr))) => {
-                                // TODO(design): ServerState::Busy/Waiting no longer maps to reality —
-                                // connections are now handled concurrently so the server is never
-                                // exclusively "busy". Replace with a connection counter (AtomicUsize)
-                                // or remove ServerState entirely.
+                            Ok((stream, client_addr)) => {
                                 let broker_client = Arc::new(Mutex::new(BrokerClient::new()));
                                 self.clients.lock().await.insert(client_addr, broker_client.lock().await.clone());
-                                // TODO(bug): spawn_connection result is silently discarded. If
-                                // peer_addr() fails the error is swallowed. Propagate or log it.
+                                // TODO(bug): errors from spawn_connection (e.g. pool channel full)
+                                // are silently discarded. Log or propagate the JoinHandle result.
                                 _ = tokio::spawn(self.clone().spawn_connection(pool.clone(), stream, broker_client, stop_word.clone(), client_addr));
-                            }
+                            },
+                            Err(err) => { println!("[worker {:?}] error {:?}", std::thread::current().id(), err); },
                         }},
                 }
             }
