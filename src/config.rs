@@ -10,7 +10,9 @@ pub struct Config
     pub server_addr: String,
     pub server_port: String,
 }
-pub(crate) fn parse_config(path: String) -> Result<Config ,Box<dyn std::error::Error>> {
+// TODO(suggestion): `path` is taken as an owned `String` but ownership is never needed.
+// Prefer `&str` or `&std::path::Path` to avoid unnecessary allocations at the call site.
+pub(crate) fn parse_config(path: &str) -> Result<Config ,Box<dyn std::error::Error>> {
     let mut config = Config { 
         threads_limit: 0, 
         proc_limit: 0,
@@ -19,7 +21,7 @@ pub(crate) fn parse_config(path: String) -> Result<Config ,Box<dyn std::error::E
         server_port: String::from("8080"),
     };
 
-    if fs::exists(path.clone())? {
+    if fs::exists(path)? {
         let config_file = fs::read_to_string(path)?;
         let re = Regex::new(r#"(\w+)\s*=\s*(?:"([^"]+)"|(\S+))"#)?;
         let mut data: HashMap<String, String> = HashMap::new();
@@ -29,11 +31,21 @@ pub(crate) fn parse_config(path: String) -> Result<Config ,Box<dyn std::error::E
             data.insert(key, value);
         }
         // region: fill config
-        config.threads_limit = data.get("THREADS_LIMIT").unwrap().parse::<u64>().unwrap();
-        config.proc_limit = data.get("PROC_LIMIT").unwrap().parse::<u64>().unwrap();
-        config.wait_limit = data.get("WAIT_LIMIT").unwrap().parse::<u64>().unwrap();
-        config.server_addr = data.get("SERVER_ADDR").unwrap().to_string();
-        config.server_port = data.get("SERVER_PORT").unwrap().to_string();
+        // TODO(bug): Every `.unwrap()` here panics if a key is missing from the file or if the
+        // value is not a valid number. The function signature already returns a Result — use it:
+        //   config.threads_limit = data.get("THREADS_LIMIT")
+        //       .ok_or("missing THREADS_LIMIT")?
+        //       .parse::<u64>()
+        //       .map_err(|e| format!("invalid THREADS_LIMIT: {e}"))?;
+        // Apply the same pattern to all keys below.
+        config.threads_limit = data.get("THREADS_LIMIT").ok_or("missing THREADS_LIMIT")?.parse::<u64>()?;
+        // TODO(bug): PROC_LIMIT is parsed and stored in Config but never read anywhere in
+        // server.rs. Either use it (e.g. as a per-worker job concurrency cap) or remove it
+        // from both the Config struct and the .settings file to avoid confusion.
+        config.proc_limit = data.get("PROC_LIMIT").ok_or("missing PROC_LIMIT")?.parse::<u64>()?;
+        config.wait_limit = data.get("WAIT_LIMIT").ok_or("missing WAIT_LIMIT")?.parse::<u64>()?;
+        config.server_addr = data.get("SERVER_ADDR").ok_or("missing SERVER_ADDR")?.to_string();
+        config.server_port = data.get("SERVER_PORT").ok_or("missing SERVER_PORT")?.to_string();
         // endregion
         return Ok(config)
     }
