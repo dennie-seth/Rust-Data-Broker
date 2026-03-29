@@ -48,29 +48,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 match reason {
                     ShutdownReason::CtrlC => {
                         println!("Shutting down...");
-                        stop_word.notify();
-                        stop_accepting.notify();
+                        shutdown(&stop_accepting, &stop_word, &drained, &env_args).await?;
                     }
                     #[cfg(unix)]
                     ShutdownReason::SigTerm => {
                         println!("SigTerm received, gracefully shutting down...");
-                        stop_accepting.notify();
-                        if env_args.contains_key("--shutdown_timeout") {
-                            let mut duration = env_args.get("--shutdown_timeout").unwrap().parse::<u64>()?;
-                            if duration == 0 {
-                                duration = 30;
-                            }
-                            timeout(Duration::from_secs(duration), drained.notified()).await.
-                                        unwrap_or_else(|_| {
-                                            println!("Shutdown timed out!");
-                                            stop_word.notify();
-                                    });
-                            stop_word.notify();
-                        }
-                        else {
-                            // No timeout specified — stop immediately without waiting for drain.
-                            stop_word.notify();
-                        }
+                        shutdown(&stop_accepting, &stop_word, &drained, &env_args).await?;
                     }
                     #[cfg(unix)]
                     ShutdownReason::SigHup => {
@@ -115,4 +98,25 @@ async fn wait_for_shutdown() -> ShutdownReason {
         signal::ctrl_c().await.unwrap();
         ShutdownReason::CtrlC
     }
+}
+
+async fn shutdown(stop_accepting: &Arc<Notify>, stop_word: &Arc<Notify>, drained: &Arc<Notify>, env_args: &HashMap<String, String>) -> Result<(), Box<dyn std::error::Error>> {
+    stop_accepting.notify();
+    if env_args.contains_key("--shutdown_timeout") {
+        let mut duration = env_args.get("--shutdown_timeout").unwrap().parse::<u64>()?;
+        if duration == 0 {
+            duration = 30;
+        }
+        timeout(Duration::from_secs(duration), drained.notified()).await.
+            unwrap_or_else(|_| {
+                println!("Shutdown timed out!");
+                stop_word.notify();
+            });
+        stop_word.notify();
+    }
+    else {
+        // No timeout specified — stop immediately without waiting for drain.
+        stop_word.notify();
+    }
+    Ok(())
 }
