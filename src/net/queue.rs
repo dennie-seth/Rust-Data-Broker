@@ -11,9 +11,15 @@ pub(crate) struct QueueMessage {
     locked_by: Option<u16>,
 }
 #[derive(Debug, Clone)]
+pub(crate) struct Meta {
+    pub id: u128,
+    pub publisher_id: u16,
+    pub timestamp: u64,
+    pub locked_by: Option<u16>,
+}
+#[derive(Debug, Clone)]
 pub(crate) struct Queue {
     // TODO(design): `name` is stored but never read after construction.
-    name: String,
     order: Vec<u128>,
     queue: HashMap<u128, QueueMessage>,
     locked: HashMap<u16, u128>,
@@ -45,17 +51,26 @@ impl PartialEq<u16> for QueueMessage {
         self.locked_by.unwrap() == *client_id
     }
 }
-impl Queue {
-    pub fn new(name: String) -> Self {
+impl Meta {
+    pub fn new(id: u128, publisher_id: u16, timestamp: u64, locked_by: Option<u16>) -> Self {
         Self {
-            name,
+            id,
+            publisher_id,
+            timestamp,
+            locked_by,
+        }
+    }
+}
+impl Queue {
+    pub fn new() -> Self {
+        Self {
             order: vec!(),
             queue: HashMap::new(),
             locked: HashMap::new(),
             next_id: Some(0),
         }
     }
-    pub fn enqueue(&mut self, payload: Vec<u8>, publisher_id: u16) {
+    pub fn enqueue(&mut self, payload: Vec<u8>, publisher_id: u16) -> Result<(), std::io::Error> {
         let id;
         if self.order.is_empty() {
             id = 0;
@@ -69,6 +84,8 @@ impl Queue {
         }
         self.order.push(id);
         self.queue.insert(id, QueueMessage::new(payload, publisher_id));
+        
+        Ok(())
     }
     pub fn lock_to_read(&mut self, client_id: u16) -> Result<Vec<u8>, std::io::Error> {
         if self.order.is_empty() || self.next_id.is_none() {
@@ -164,6 +181,18 @@ impl Queue {
             }
         }
         Ok(())
+    }
+    pub fn list_messages(&self) -> Result<Vec<Meta>, std::io::Error> {
+        let mut result = Vec::<Meta>::with_capacity(self.queue.len());
+        for (key, value) in self.queue.iter() {
+            result.push(Meta::new(
+                *key,
+                value.publisher_id,
+                value.timestamp,
+                value.locked_by
+            ))
+        }
+        Ok(result)
     }
     fn remove_zeroes(&mut self) {
         if self.order.len() >= MAGIC_DRAIN_VEC {

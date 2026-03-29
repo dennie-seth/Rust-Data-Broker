@@ -23,6 +23,7 @@ mod tests {
             wait_limit: 8,
             server_addr: address.ip().to_string(),
             server_port: address.port().to_string(),
+            queue_names: vec!["test".to_string()],
         }
     }
 

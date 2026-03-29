@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap};
 use std::io;
 use std::net::{SocketAddr, SocketAddrV4};
 use std::pin::Pin;
@@ -12,6 +12,12 @@ use tokio::sync::{Mutex};
 use bytes::BytesMut;
 use tokio::net::tcp::OwnedWriteHalf;
 use crate::config::Config;
+use crate::net::queue::Queue;
+
+static COMMAND_SIZE: usize = 1usize;
+static PAYLOAD_SIZE: usize = 8usize;
+static CLIENT_ID_SIZE: usize = 16usize;
+static QUEUE_NAME_SIZE: usize = 64usize;
 
 type Job = Pin<Box<dyn Future<Output = ()> + Send>>;
 #[derive(Debug)]
@@ -105,12 +111,28 @@ impl Notify {
 pub(crate) enum Request {
     Enqueue = 1,
     Dequeue = 2,
+    CreateQ = 3,
+    DeleteQ = 4,
+    PeekM = 5,
+    DeleteM = 6,
+    Succeeded = 7,
+    Failed = 8,
+    Requeue = 9,
+    UpdateM = 10,
 }
 impl Request {
     pub(crate) fn from_u8(value: u8) -> Result<Self, std::io::Error> {
         match value {
             1 => Ok(Request::Enqueue),
             2 => Ok(Request::Dequeue),
+            3 => Ok(Request::CreateQ),
+            4 => Ok(Request::DeleteQ),
+            5 => Ok(Request::PeekM),
+            6 => Ok(Request::DeleteM),
+            7 => Ok(Request::Succeeded),
+            8 => Ok(Request::Failed),
+            9 => Ok(Request::Requeue),
+            10 => Ok(Request::UpdateM),
             _ => Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Unknown request type")),
         }
     }
@@ -136,35 +158,20 @@ pub(crate) struct Server {
     // TODO(design): This map is currently write-only — nothing reads it to route messages
     // between clients. For a real broker you'd need a shared global queue (or topic map) that
     // any client can enqueue into and any other client can dequeue from.
-    clients: Arc<Mutex<HashMap<SocketAddr, BrokerClient>>>,
+    queue: HashMap<String, Arc<Mutex<Queue>>>,
     stop_word: Arc<Notify>,
     stop_accepting: Arc<Notify>,
     active_connections: Arc<AtomicUsize>,
 }
 #[derive(Debug, Clone)]
 pub(crate) struct BrokerClient {
-    payload_queue: Arc<Mutex<VecDeque<RequestMessage>>>,
+    id: u16,
 }
 impl BrokerClient {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(id: u16) -> Self {
         Self {
-            payload_queue: Arc::new(Mutex::new(VecDeque::new())),
+            id,
         }
-    }
-    pub(crate) async fn enqueue(&mut self, message: &RequestMessage) -> Result<(), std::io::Error> {
-        self.payload_queue.lock().await.push_back(message.clone());
-        println!("[worker {:?}] enqueued a message of size {:?}",
-                 std::thread::current().id(), message.payload_size);
-        Ok(())
-    }
-    pub(crate) async fn dequeue(&mut self) -> Result<RequestMessage, std::io::Error> {
-        let message = self.payload_queue.lock().await.pop_front();
-        if message.is_some() {
-            println!("[worker {:?}] dequeued a message of size {:?}",
-                std::thread::current().id(), message.clone().unwrap().payload_size);
-            return Ok(message.unwrap())
-        }
-        Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "no message to dequeue"))
     }
 }
 #[derive(Debug, Clone)]
@@ -206,98 +213,12 @@ impl ResponseMessage {
         bytes
     }
 }
-async fn send_message(stream: Arc<Mutex<OwnedWriteHalf>>, broker_client: Arc<Mutex<BrokerClient>>) -> Result<(), std::io::Error> {
-    let message = broker_client.lock().await.dequeue().await?;
-    let message = ResponseMessage::new(Response::Succeeded, message.payload);
-    stream.lock().await.write_all(&message.to_u8()).await?;
-    Ok(())
-}
-async fn read_buffer(stream: TcpStream, broker_client: Arc<Mutex<BrokerClient>>, stop_word: Arc<Notify>) -> Result<(), std::io::Error>
-{
-    let mut buffer = BytesMut::with_capacity(1024*4);
-    let (mut stream_read, stream_write) = stream.into_split();
-    let stream_write = Arc::new(Mutex::new(stream_write));
-
-    loop {
-        tokio::select! {
-            _ = stop_word.notified() => { break; },
-            result = stream_read.read_buf(&mut buffer) => {
-                if result? == 0 { break; }
-            }
-        }
-
-        if buffer.len() >= 9 {
-            let payload_size = u64::from_be_bytes(buffer[1..9].try_into().unwrap());
-            if buffer.len() < payload_size as usize + 9 {
-                continue;
-            }
-            let command = Request::from_u8(buffer[0])?;
-            let message = RequestMessage::new(&command, buffer.split_to(9 + payload_size as usize));
-
-            match command{
-                Request::Enqueue => {
-                    let broker_client = broker_client.clone();
-                    let writer = stream_write.clone();
-
-                    tokio::spawn(async move {
-                        let message = match message
-                        {
-                            Ok(message) => message,
-                            Err(err) => {
-                                let response = ResponseMessage::new(Response::Failed, vec!());
-                                send_response(writer, &response).await;
-                                println!("[worker {:?}] parse_message error {:?}", std::thread::current().id(), err);
-                                return;
-                            }
-                        };
-                        match broker_client.lock().await.enqueue(&message).await {
-                            Ok(_) => {
-                                let response = ResponseMessage::new(Response::Succeeded, vec!());
-                                send_response(writer, &response).await;
-                            },
-                            Err(err) => {
-                                let response = ResponseMessage::new(Response::Failed, vec!());
-                                send_response(writer, &response).await;
-                                println!("[worker {:?}] enqueue error {:?}", std::thread::current().id(), err);
-                            }
-                        }
-                    });
-                }
-                Request::Dequeue => {
-                    let broker_client = broker_client.clone();
-                    let writer = stream_write.clone();
-
-                    tokio::spawn(async move {
-                        match send_message(writer.clone(), broker_client).await {
-                            Ok(_) => {},
-                            Err(err) => {
-                                let response = ResponseMessage::new(Response::Failed, vec!());
-                                send_response(writer, &response).await;
-                                println!("[worker {:?}] send_message error {:?}", std::thread::current().id(), err);
-                            }
-                        }
-                    });
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-async fn send_response(stream: Arc<Mutex<OwnedWriteHalf>>, response: &ResponseMessage) {
-    match stream.lock().await.write_all(&response.to_u8()).await {
-        Ok(_) => (),
-        Err(err) => {
-            println!("[worker {:?}] response error {:?}", std::thread::current().id(), err);
-        }
-    }
-}
-
 impl Server {
     fn new(addr: Addr, stop_word: Arc<Notify>, stop_accepting: Arc<Notify>) -> Self {
+
         Self {
             addr,
-            clients: Arc::new(Mutex::new(HashMap::new())),
+            queue: HashMap::new(),
             stop_word,
             stop_accepting,
             active_connections: Arc::new(AtomicUsize::new(0_usize)),
@@ -316,13 +237,11 @@ impl Server {
                     accept_result = listener.accept() => {
                         match accept_result {
                             Ok((stream, client_addr)) => {
-                                let broker_client = Arc::new(Mutex::new(BrokerClient::new()));
-                                self.clients.lock().await.insert(client_addr, broker_client.lock().await.clone());
                                 let server = self.clone();
                                 let pool = pool.clone();
                                 let stop_word = stop_word.clone();
                                 tokio::spawn(async move{
-                                    match server.spawn_connection(pool, stream, broker_client, stop_word.clone(), client_addr).await {
+                                    match server.spawn_connection(pool, stream, stop_word.clone(), client_addr).await {
                                         Ok(_) => {},
                                         Err(err) => {
                                             println!("[worker {:?}] spawn_connection error {:?}", std::thread::current().id(), err);
@@ -346,17 +265,160 @@ impl Server {
     // only goes into A's queue, and Dequeue from A only reads from A's queue. This makes it a
     // per-connection buffer, not a message broker. For real pub/sub or work-queue semantics you need
     // a shared global queue (or named topic map) that is independent of individual connections.
-    async fn handle_connection(self, stream: TcpStream, broker_client: Arc<Mutex<BrokerClient>>, stop_word: Arc<Notify>, addr: SocketAddr) {
+    async fn handle_connection(&self, stream: TcpStream, stop_word: Arc<Notify>) {
         self.active_connections.fetch_add(1, Relaxed);
-        if let Err(err) = read_buffer(stream, broker_client.clone(), stop_word.clone()).await {
+        if let Err(err) = self.clone().read_buffer(stream, stop_word.clone()).await {
             println!("[worker {:?}] read_buffer error {:?}", std::thread::current().id(), err);
         }
-        self.clients.lock().await.remove(&addr);
         self.active_connections.fetch_sub(1, Relaxed);
     }
-    async fn spawn_connection(self, pool: Arc<Pool>, socket: TcpStream, broker_client: Arc<Mutex<BrokerClient>>, stop_word: Arc<Notify>, addr: SocketAddr) -> Result<(), std::io::Error>{
+    async fn spawn_connection(self, pool: Arc<Pool>, socket: TcpStream, stop_word: Arc<Notify>, addr: SocketAddr) -> Result<(), std::io::Error>{
         println!("New connection from {}", addr);
-        pool.spawn(async move { self.handle_connection(socket, broker_client, stop_word.clone(), addr).await }).await
+        pool.spawn(async move { self.handle_connection(socket, stop_word.clone()).await }).await
+    }
+    async fn send_message(self, stream: Arc<Mutex<OwnedWriteHalf>>, queue_name: String, client_id: u16) -> Result<(), std::io::Error> {
+        if let Some(queue) = self.queue.get(&queue_name) {
+            let message = queue.lock().await.lock_to_read(client_id);
+            match message {
+                Ok(message) => {
+                    let message = ResponseMessage::new(Response::Succeeded, message);
+                    stream.lock().await.write_all(&message.to_u8()).await?;
+                    return Ok(())
+                }
+                Err(err) => {
+                    println!("[worker {:?}] send_message error {:?}", std::thread::current().id(), err);
+                }
+            }
+        }
+        Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Failed to send message"))
+    }
+    async fn clear_message_sent(self, queue_name: String, client_id: u16, message_id: Option<u128>) -> Result<(), std::io::Error> {
+        if let Some(queue) = self.queue.get(&queue_name)
+        {
+            let cleared = queue.lock().await.dequeue(client_id, message_id);
+            match cleared {
+                Ok(_) => {
+                    Ok(())
+                }
+                Err(err) => {
+                    Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, err.to_string()))
+                }
+            }
+        }
+        else {
+            Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Queue not found"))
+        }
+    }
+    async fn send_response(self, stream: Arc<Mutex<OwnedWriteHalf>>, response: &ResponseMessage) {
+        match stream.lock().await.write_all(&response.to_u8()).await {
+            Ok(_) => (),
+            Err(err) => {
+                println!("[worker {:?}] response error {:?}", std::thread::current().id(), err);
+            }
+        }
+    }
+    async fn read_buffer(&mut self, stream: TcpStream, stop_word: Arc<Notify>) -> Result<(), std::io::Error>
+    {
+        let mut buffer = BytesMut::with_capacity(1024 * 4);
+        let (mut stream_read, stream_write) = stream.into_split();
+        let stream_write = Arc::new(Mutex::new(stream_write));
+
+        loop {
+            tokio::select! {
+            _ = stop_word.notified() => { break; },
+            result = stream_read.read_buf(&mut buffer) => {
+                if result? == 0 { break; }
+            }
+        }
+
+            if buffer.len() >= COMMAND_SIZE + CLIENT_ID_SIZE + PAYLOAD_SIZE {
+                let command = Request::from_u8(buffer[0])?;
+                let client_id = u16::from_be_bytes(buffer[COMMAND_SIZE..(COMMAND_SIZE+CLIENT_ID_SIZE)].try_into().unwrap());
+                let payload_size = u64::from_be_bytes(buffer[(COMMAND_SIZE+CLIENT_ID_SIZE)..(COMMAND_SIZE+CLIENT_ID_SIZE+PAYLOAD_SIZE)].try_into().unwrap());
+                if buffer.len() < payload_size as usize + (COMMAND_SIZE+CLIENT_ID_SIZE+PAYLOAD_SIZE) {
+                    continue;
+                }
+                let queue_name = String::from_utf8(buffer[(COMMAND_SIZE+CLIENT_ID_SIZE+PAYLOAD_SIZE)..(COMMAND_SIZE+CLIENT_ID_SIZE+PAYLOAD_SIZE+QUEUE_NAME_SIZE)].try_into().unwrap());
+                let message = RequestMessage::new(&command, buffer.split_to((COMMAND_SIZE+CLIENT_ID_SIZE+PAYLOAD_SIZE+QUEUE_NAME_SIZE) + payload_size as usize));
+
+                let queue_name = queue_name.unwrap_or_else(|err| {
+                    println!("[worker {:?}] queue name error {:?}", std::thread::current().id(), err);
+                    "".to_string()
+                });
+                match command {
+                    Request::Enqueue => {
+                        let writer = stream_write.clone();
+                        let server = self.clone();
+
+                        tokio::spawn(async move {
+                            let message = match message
+                            {
+                                Ok(message) => message,
+                                Err(err) => {
+                                    let response = ResponseMessage::new(Response::Failed, vec!());
+                                    server.send_response(writer, &response).await;
+                                    println!("[worker {:?}] parse_message error {:?}", std::thread::current().id(), err);
+                                    return;
+                                }
+                            };
+                            if let Some(queue) = server.queue.get(&queue_name) {
+                                match queue.lock().await.enqueue(message.payload, client_id) {
+                                    Ok(_) => {
+                                        let response = ResponseMessage::new(Response::Succeeded, vec!());
+                                        server.clone().send_response(writer, &response).await;
+                                    }
+                                    Err(err) => {
+                                        let response = ResponseMessage::new(Response::Failed, vec!());
+                                        server.clone().send_response(writer, &response).await;
+                                        println!("[worker {:?}] enqueue error {:?}", std::thread::current().id(), err);
+                                    }
+                                }
+                            }
+                        });
+                    }
+                    Request::Dequeue => {
+                        let writer = stream_write.clone();
+                        let server = self.clone();
+
+                        tokio::spawn(async move {
+                            match server.clone().send_message(writer.clone(), queue_name, client_id).await {
+                                Ok(_) => {},
+                                Err(err) => {
+                                    let response = ResponseMessage::new(Response::Failed, vec!());
+                                    server.clone().send_response(writer, &response).await;
+                                    println!("[worker {:?}] send_message error {:?}", std::thread::current().id(), err);
+                                }
+                            }
+                        });
+                    }
+                    Request::CreateQ => {
+
+                    }
+                    Request::DeleteQ => {
+
+                    }
+                    Request::PeekM => {
+
+                    }
+                    Request::DeleteM => {
+
+                    }
+                    Request::Succeeded => {
+
+                    }
+                    Request::Failed => {
+
+                    }
+                    Request::Requeue => {
+
+                    }
+                    Request::UpdateM => {
+
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 }
 pub(crate) fn start_server(config: Config, drained: Arc<Notify>) -> Result<(Arc<Notify>, Arc<Notify>), Box<dyn std::error::Error>> {

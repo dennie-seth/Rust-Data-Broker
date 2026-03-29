@@ -10,6 +10,7 @@ pub struct Config
     pub wait_limit: u64,
     pub server_addr: String,
     pub server_port: String,
+    pub queue_names: Vec<String>,
 }
 static RE: OnceLock<Regex> = OnceLock::new();
 pub(crate) fn parse_config(path: &str) -> Result<Config ,Box<dyn std::error::Error>> {
@@ -30,10 +31,11 @@ pub(crate) fn parse_config(path: &str) -> Result<Config ,Box<dyn std::error::Err
                 // TODO(design): PROC_LIMIT is parsed and stored in Config but never read anywhere in
                 // server.rs. Either use it (e.g. as a per-worker job concurrency cap) or remove it
                 // from both the Config struct and the .settings file to avoid confusion.
-                proc_limit : data.get("PROC_LIMIT").ok_or("missing PROC_LIMIT") ?.parse:: < u64>()?,
-                wait_limit : data.get("WAIT_LIMIT").ok_or("missing WAIT_LIMIT") ?.parse:: < u64>()?,
-                server_addr : data.get("SERVER_ADDR").ok_or("missing SERVER_ADDR") ?.to_string(),
-                server_port : data.get("SERVER_PORT").ok_or("missing SERVER_PORT")?.to_string(),
+                proc_limit: data.get("PROC_LIMIT").ok_or("missing PROC_LIMIT") ?.parse:: < u64>()?,
+                wait_limit: data.get("WAIT_LIMIT").ok_or("missing WAIT_LIMIT") ?.parse:: < u64>()?,
+                server_addr: data.get("SERVER_ADDR").ok_or("missing SERVER_ADDR") ?.to_string(),
+                server_port: data.get("SERVER_PORT").ok_or("missing SERVER_PORT")?.to_string(),
+                queue_names: data.get("QUEUE_NAMES").ok_or("missing QUEUE_NAMES")?.split(',').map(|s| s.to_string()).collect(),
             };
             // endregion
             Ok(config)
