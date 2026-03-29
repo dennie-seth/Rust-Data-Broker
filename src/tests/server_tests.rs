@@ -23,16 +23,42 @@ mod tests {
             wait_limit: 8,
             server_addr: address.ip().to_string(),
             server_port: address.port().to_string(),
-            queue_names: vec!["test".to_string()],
+            queue_names: vec![],
         }
     }
 
-    fn encode_request(command: u8, payload: &[u8]) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(1 + 8 + payload.len());
+    /// Encodes a request using the full wire protocol:
+    /// [1 byte command][16 bytes client_id][8 bytes payload_size][64 bytes queue_name][payload]
+    ///
+    /// Note: queue_name is null-padded to 64 bytes. Pre-configured queues (from Config::queue_names)
+    /// are stored without padding and will NOT match wire-format lookups — always use CreateQ (3)
+    /// in tests to create queues so both sides use the same padded key.
+    fn encode_request(command: u8, client_id: u128, queue_name: &str, payload: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::new();
         buf.push(command);
+        buf.extend_from_slice(&client_id.to_be_bytes());
         buf.extend_from_slice(&(payload.len() as u64).to_be_bytes());
+        let mut qname_buf = [0u8; 64];
+        let name_bytes = queue_name.as_bytes();
+        qname_buf[..name_bytes.len().min(64)].copy_from_slice(&name_bytes[..name_bytes.len().min(64)]);
+        buf.extend_from_slice(&qname_buf);
         buf.extend_from_slice(payload);
         buf
+    }
+
+    async fn read_response(client: &mut TcpStream) -> Vec<u8> {
+        let mut header = [0u8; 9];
+        timeout(Duration::from_secs(1), client.read_exact(&mut header))
+            .await.expect("timed out reading response header").unwrap();
+        let payload_size = u64::from_be_bytes(header[1..9].try_into().unwrap()) as usize;
+        let mut response = header.to_vec();
+        if payload_size > 0 {
+            let mut payload = vec![0u8; payload_size];
+            timeout(Duration::from_secs(1), client.read_exact(&mut payload))
+                .await.expect("timed out reading response payload").unwrap();
+            response.extend_from_slice(&payload);
+        }
+        response
     }
 
     // --- Notify tests ---
@@ -125,6 +151,42 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn server_create_queue_responds_success() {
+        let address = free_local_addr();
+        let drained = Arc::new(Notify::new());
+        let (stop_word, _) = start_server(make_config(address), drained).unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut client = TcpStream::connect(address).await.unwrap();
+        client.write_all(&encode_request(3, 1, "myqueue", &[])).await.unwrap();
+
+        let response = read_response(&mut client).await;
+        assert_eq!(response[0], 1, "CreateQ: expected Succeeded (1)");
+
+        stop_word.notify();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn server_create_queue_duplicate_responds_failure() {
+        let address = free_local_addr();
+        let drained = Arc::new(Notify::new());
+        let (stop_word, _) = start_server(make_config(address), drained).unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut client = TcpStream::connect(address).await.unwrap();
+
+        client.write_all(&encode_request(3, 1, "myqueue", &[])).await.unwrap();
+        let response = read_response(&mut client).await;
+        assert_eq!(response[0], 1, "first CreateQ: expected Succeeded");
+
+        client.write_all(&encode_request(3, 1, "myqueue", &[])).await.unwrap();
+        let response = read_response(&mut client).await;
+        assert_eq!(response[0], 2, "duplicate CreateQ: expected Failed");
+
+        stop_word.notify();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn server_enqueue_responds_success() {
         let address = free_local_addr();
         let drained = Arc::new(Notify::new());
@@ -132,12 +194,14 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         let mut client = TcpStream::connect(address).await.unwrap();
-        client.write_all(&encode_request(1, b"hello world")).await.unwrap();
 
-        let mut response = [0u8; 9];
-        timeout(Duration::from_secs(1), client.read_exact(&mut response))
-            .await.expect("timed out reading response").unwrap();
-        assert_eq!(response[0], 1, "expected Succeeded (1)");
+        client.write_all(&encode_request(3, 1, "myqueue", &[])).await.unwrap();
+        let response = read_response(&mut client).await;
+        assert_eq!(response[0], 1, "CreateQ: expected Succeeded");
+
+        client.write_all(&encode_request(1, 1, "myqueue", b"hello world")).await.unwrap();
+        let response = read_response(&mut client).await;
+        assert_eq!(response[0], 1, "Enqueue: expected Succeeded");
 
         stop_word.notify();
     }
@@ -150,12 +214,14 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         let mut client = TcpStream::connect(address).await.unwrap();
-        client.write_all(&encode_request(2, b"")).await.unwrap();
 
-        let mut response = [0u8; 9];
-        timeout(Duration::from_secs(1), client.read_exact(&mut response))
-            .await.expect("timed out reading response").unwrap();
-        assert_eq!(response[0], 2, "expected Failed (2)");
+        client.write_all(&encode_request(3, 1, "myqueue", &[])).await.unwrap();
+        let response = read_response(&mut client).await;
+        assert_eq!(response[0], 1, "CreateQ: expected Succeeded");
+
+        client.write_all(&encode_request(2, 1, "myqueue", &[])).await.unwrap();
+        let response = read_response(&mut client).await;
+        assert_eq!(response[0], 2, "Dequeue empty: expected Failed");
 
         stop_word.notify();
     }
@@ -170,21 +236,18 @@ mod tests {
         let mut client = TcpStream::connect(address).await.unwrap();
         let payload = b"hello world";
 
-        // Enqueue
-        client.write_all(&encode_request(1, payload)).await.unwrap();
-        let mut response = [0u8; 9];
-        timeout(Duration::from_secs(1), client.read_exact(&mut response))
-            .await.expect("timed out on enqueue response").unwrap();
-        assert_eq!(response[0], 1, "enqueue: expected Succeeded");
+        client.write_all(&encode_request(3, 1, "myqueue", &[])).await.unwrap();
+        let response = read_response(&mut client).await;
+        assert_eq!(response[0], 1, "CreateQ: expected Succeeded");
 
-        // Dequeue
-        client.write_all(&encode_request(2, b"")).await.unwrap();
-        let payload_size = payload.len() as u64;
-        let mut response = vec![0u8; 9 + payload_size as usize];
-        timeout(Duration::from_secs(1), client.read_exact(&mut response))
-            .await.expect("timed out on dequeue response").unwrap();
-        assert_eq!(response[0], 1, "dequeue: expected Succeeded");
-        assert_eq!(&response[9..], payload);
+        client.write_all(&encode_request(1, 1, "myqueue", payload)).await.unwrap();
+        let response = read_response(&mut client).await;
+        assert_eq!(response[0], 1, "Enqueue: expected Succeeded");
+
+        client.write_all(&encode_request(2, 1, "myqueue", &[])).await.unwrap();
+        let response = read_response(&mut client).await;
+        assert_eq!(response[0], 1, "Dequeue: expected Succeeded");
+        assert_eq!(&response[9..], payload, "Dequeue: payload mismatch");
 
         stop_word.notify();
     }
@@ -196,20 +259,53 @@ mod tests {
         let (stop_word, _) = start_server(make_config(address), drained).unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
 
+        // Create a shared queue
+        {
+            let mut setup = TcpStream::connect(address).await.unwrap();
+            setup.write_all(&encode_request(3, 0, "shared", &[])).await.unwrap();
+            let response = read_response(&mut setup).await;
+            assert_eq!(response[0], 1, "CreateQ: expected Succeeded");
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
         let mut handles = vec![];
-        for i in 0..3u8 {
+        for i in 1..=3u128 {
             handles.push(tokio::spawn(async move {
                 let mut client = TcpStream::connect(address).await.unwrap();
-                let payload = vec![i; 4];
-                client.write_all(&encode_request(1, &payload)).await.unwrap();
-                let mut response = [0u8; 9];
-                timeout(Duration::from_secs(1), client.read_exact(&mut response))
-                    .await.expect("timed out").unwrap();
-                assert_eq!(response[0], 1);
+                let payload = vec![i as u8; 4];
+                client.write_all(&encode_request(1, i, "shared", &payload)).await.unwrap();
+                let response = read_response(&mut client).await;
+                assert_eq!(response[0], 1, "client {i}: Enqueue expected Succeeded");
             }));
         }
         for h in handles { h.await.unwrap(); }
 
         stop_word.notify();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn server_graceful_shutdown_drains_connections() {
+        let address = free_local_addr();
+        let drained = Arc::new(Notify::new());
+        let (stop_word, stop_accepting) =
+            start_server(make_config(address), drained.clone()).unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let client = TcpStream::connect(address).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        // Spawn the drain waiter before signalling shutdown so it is registered
+        // before notify_waiters() fires on the drained Notify.
+        let drained_clone = drained.clone();
+        let drain_waiter = tokio::spawn(async move { drained_clone.notified().await });
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        stop_accepting.notify(); // stop accepting new connections
+        stop_word.notify();      // stop active connections
+        drop(client);            // close client side so read_buffer returns immediately
+
+        timeout(Duration::from_secs(2), drain_waiter)
+            .await.expect("server did not drain within timeout")
+            .unwrap();
     }
 }

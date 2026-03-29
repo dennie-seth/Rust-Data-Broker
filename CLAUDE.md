@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-DataBroker is a tutorial Rust TCP-based message queue. Clients connect and issue Enqueue/Dequeue commands over a binary protocol. It's explicitly a learning project — the codebase contains many TODO comments documenting known bugs and design issues.
+DataBroker is a tutorial Rust TCP-based message queue. Clients connect and issue commands over a binary protocol. Named queues are shared across all connected clients. It's explicitly a learning project — the codebase contains many TODO comments documenting known bugs and design issues.
 
 ## Commands
 
@@ -37,8 +37,20 @@ cargo test <test_name>
 
 ### Message Protocol (binary, big-endian)
 
-**Request:** `[1 byte command][8 bytes payload_size][payload]`
-- Command `1` = Enqueue, `2` = Dequeue
+**Request:** `[1 byte command][16 bytes client_id][8 bytes payload_size][64 bytes queue_name][payload]`
+
+| Command | Value | Description |
+|---------|-------|-------------|
+| Enqueue | 1 | Push a message onto a named queue |
+| Dequeue | 2 | Lock and read the next message from a named queue |
+| CreateQ | 3 | Create a new named queue at runtime |
+| DeleteQ | 4 | Delete a named queue |
+| PeekM   | 5 | List message metadata for a named queue |
+| DeleteM | 6 | Delete a specific message by ID (payload = 16-byte message ID) |
+| Succeeded | 7 | Acknowledge processing — dequeues the message locked by this client |
+| Failed  | 8 | Nack — unlocks the message so another client can dequeue it |
+| Requeue | 9 | Not yet implemented |
+| UpdateM | 10 | Not yet implemented |
 
 **Response:** `[1 byte status][8 bytes payload_size][payload]`
 - Status `1` = Succeeded, `2` = Failed
@@ -50,7 +62,7 @@ cargo test <test_name>
 | `Config` | `src/config.rs` | Parsed from `.settings` (key=value, regex-based) |
 | `Server` | `src/net/server.rs` | TCP listener; accepts connections and hands to `Pool` |
 | `Pool` | `src/net/server.rs` | Worker thread pool with pressure-based dispatch |
-| `BrokerClient` | `src/net/server.rs` | Per-connection `VecDeque` queue (not shared across clients) |
+| `Queue` | `src/net/queue.rs` | Named message queue with lock-to-read / ack semantics |
 
 ### Config Fields
 
@@ -61,9 +73,11 @@ cargo test <test_name>
 | `SERVER_ADDR` | `server_addr` | Listen IP |
 | `SERVER_PORT` | `server_port` | Listen port |
 | `PROC_LIMIT` | `proc_limit` | Parsed but currently unused |
+| `QUEUE_NAMES` | `queue_names` | Comma-separated list of queues pre-created at startup |
 
 ### Known Design Limitations (intentional, for learning)
 
-- Each connection has an **isolated queue** — no inter-client message sharing (not a true broker)
-- `clients` map is write-only — entries are removed on disconnect but nothing reads the map to route messages between clients
 - `command` field in `RequestMessage` is stored but never read after construction
+- `Requeue` and `UpdateM` commands are defined but not implemented — no response is sent, leaving clients hanging
+- `locked_by` sentinel in `Meta::to_be_bytes` uses `0xFFFF` which was safe for `u16` but is now a valid `u128` client ID — should use `u128::MAX`
+- `PROC_LIMIT` is parsed but never used

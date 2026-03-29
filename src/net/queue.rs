@@ -6,27 +6,26 @@ static MAGIC_DRAIN_VEC: usize = 10usize;
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct QueueMessage {
     payload: Vec<u8>,
-    publisher_id: u16,
+    publisher_id: u128,
     timestamp: u64,
-    locked_by: Option<u16>,
+    locked_by: Option<u128>,
 }
 #[derive(Debug, Clone)]
 pub(crate) struct Meta {
     pub id: u128,
-    pub publisher_id: u16,
+    pub publisher_id: u128,
     pub timestamp: u64,
-    pub locked_by: Option<u16>,
+    pub locked_by: Option<u128>,
 }
 #[derive(Debug, Clone)]
 pub(crate) struct Queue {
-    // TODO(design): `name` is stored but never read after construction.
     order: Vec<u128>,
     queue: HashMap<u128, QueueMessage>,
-    locked: HashMap<u16, u128>,
+    locked: HashMap<u128, u128>,
     next_id: Option<u128>, // next non-locked message
 }
 impl QueueMessage {
-    pub fn new(payload: Vec<u8>, publisher_id: u16) -> Self {
+    pub fn new(payload: Vec<u8>, publisher_id: u128) -> Self {
         Self {
             payload,
             publisher_id,
@@ -39,20 +38,20 @@ impl QueueMessage {
     pub fn is_locked(&self) -> bool {
         self.locked_by.is_some()
     }
-    pub fn lock(&mut self, id: u16) {
+    pub fn lock(&mut self, id: u128) {
         self.locked_by = Some(id)
     }
     pub fn unlock(&mut self) {
         self.locked_by = None
     }
 }
-impl PartialEq<u16> for QueueMessage {
-    fn eq(&self, client_id: &u16) -> bool {
-        self.locked_by.unwrap() == *client_id
+impl PartialEq<u128> for QueueMessage {
+    fn eq(&self, client_id: &u128) -> bool {
+        self.locked_by.map_or(false, |id| id == *client_id)
     }
 }
 impl Meta {
-    pub fn new(id: u128, publisher_id: u16, timestamp: u64, locked_by: Option<u16>) -> Self {
+    pub fn new(id: u128, publisher_id: u128, timestamp: u64, locked_by: Option<u128>) -> Self {
         Self {
             id,
             publisher_id,
@@ -65,7 +64,7 @@ impl Meta {
         bytes.append(&mut self.id.to_be_bytes().to_vec());
         bytes.append(&mut self.publisher_id.to_be_bytes().to_vec());
         bytes.append(&mut self.timestamp.to_be_bytes().to_vec());
-        bytes.append(&mut self.locked_by.unwrap().to_be_bytes().to_vec());
+        bytes.append(&mut self.locked_by.map_or(u128::MAX, |id| id).to_be_bytes().to_vec());
         bytes
     }
 }
@@ -75,13 +74,13 @@ impl Queue {
             order: vec!(),
             queue: HashMap::new(),
             locked: HashMap::new(),
-            next_id: Some(0),
+            next_id: None,
         }
     }
-    pub fn enqueue(&mut self, payload: Vec<u8>, publisher_id: u16) -> Result<(), std::io::Error> {
-        let id;
+    pub fn enqueue(&mut self, payload: Vec<u8>, publisher_id: u128) -> Result<(), std::io::Error> {
+        let mut id;
         if self.order.is_empty() {
-            id = 0;
+            id = 1;
         }
         else {
             let (result, _) = self.order.last().unwrap().overflowing_add(1);
@@ -89,13 +88,19 @@ impl Queue {
             //            in the queue, this produces a duplicate ID and silently overwrites the
             //            existing entry in self.queue. This is expected behavior for now.
             id = result;
+            if id == 0 {
+                id = 1;
+            }
+        }
+        if self.next_id.is_none() {
+            self.next_id = Some(id);
         }
         self.order.push(id);
         self.queue.insert(id, QueueMessage::new(payload, publisher_id));
 
         Ok(())
     }
-    pub fn lock_to_read(&mut self, client_id: u16) -> Result<Vec<u8>, std::io::Error> {
+    pub fn lock_to_read(&mut self, client_id: u128) -> Result<Vec<u8>, std::io::Error> {
         if self.order.is_empty() || self.next_id.is_none() {
             return Err(std::io::Error::new(ErrorKind::InvalidData, "Queue is empty"));
         }
@@ -130,7 +135,7 @@ impl Queue {
         }
         Ok(payload)
     }
-    pub fn dequeue(&mut self, client_id: u16, message_id: Option<u128>) -> Result<(), std::io::Error> {
+    pub fn dequeue(&mut self, client_id: u128, message_id: Option<u128>) -> Result<(), std::io::Error> {
         if self.order.is_empty() {
             return Err(std::io::Error::new(ErrorKind::InvalidData, "Queue is empty"));
         }
@@ -173,7 +178,7 @@ impl Queue {
         self.remove_zeroes();
         Ok(())
     }
-    pub fn unlock(&mut self, client_id: u16) -> Result<(), std::io::Error> {
+    pub fn unlock(&mut self, client_id: u128) -> Result<(), std::io::Error> {
         if self.order.is_empty() {
             return Err(std::io::Error::new(ErrorKind::InvalidData, "Queue is empty"));
         }
@@ -184,7 +189,12 @@ impl Queue {
             if let Some(message) = self.queue.get_mut(&id) {
                 message.unlock();
             }
-            if id < self.next_id.unwrap() {
+            if self.next_id != None {
+                if id < self.next_id.unwrap() {
+                    self.next_id = Some(id);
+                }
+            }
+            else {
                 self.next_id = Some(id);
             }
         }

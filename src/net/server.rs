@@ -8,7 +8,7 @@ use std::sync::atomic::Ordering::Relaxed;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Mutex};
+use tokio::sync::{Mutex, RwLock};
 use bytes::BytesMut;
 use tokio::net::tcp::OwnedWriteHalf;
 use crate::config::Config;
@@ -155,24 +155,10 @@ impl Response {
 #[derive(Debug, Clone)]
 pub(crate) struct Server {
     addr: Addr,
-    // TODO(design): This map is currently write-only — nothing reads it to route messages
-    // between clients. For a real broker you'd need a shared global queue (or topic map) that
-    // any client can enqueue into and any other client can dequeue from.
-    queue: HashMap<String, Arc<Mutex<Queue>>>,
+    queue: Arc<RwLock<HashMap<String, Arc<Mutex<Queue>>>>>,
     stop_word: Arc<Notify>,
     stop_accepting: Arc<Notify>,
     active_connections: Arc<AtomicUsize>,
-}
-#[derive(Debug, Clone)]
-pub(crate) struct BrokerClient {
-    id: u16,
-}
-impl BrokerClient {
-    pub(crate) fn new(id: u16) -> Self {
-        Self {
-            id,
-        }
-    }
 }
 #[derive(Debug, Clone)]
 pub(crate) struct RequestMessage {
@@ -186,8 +172,8 @@ impl RequestMessage {
     pub(crate) fn new(command: &Request, bytes: BytesMut) -> Result<Self, std::io::Error> {
         Ok(Self {
             command:  command.to_owned(),
-            payload_size: u64::from_be_bytes(bytes[1..9].try_into().unwrap()),
-            payload: bytes[9..].to_vec(),
+            payload_size: u64::from_be_bytes(bytes[COMMAND_SIZE+CLIENT_ID_SIZE..COMMAND_SIZE+CLIENT_ID_SIZE+PAYLOAD_SIZE].try_into().unwrap()),
+            payload: bytes[COMMAND_SIZE+CLIENT_ID_SIZE+PAYLOAD_SIZE+QUEUE_NAME_SIZE..].to_vec(),
         })
     }
 }
@@ -218,7 +204,7 @@ impl Server {
 
         Self {
             addr,
-            queue: HashMap::new(),
+            queue: Arc::new(RwLock::new(HashMap::new())),
             stop_word,
             stop_accepting,
             active_connections: Arc::new(AtomicUsize::new(0_usize)),
@@ -231,7 +217,7 @@ impl Server {
             config.threads_limit as usize,
             config.wait_limit as usize)?);
         for queue_name in config.queue_names {
-            self.queue.insert(queue_name, Arc::new(Mutex::new(Queue::new())));
+            self.queue.write().await.insert(queue_name, Arc::new(Mutex::new(Queue::new())));
         }
         {
             loop {
@@ -264,10 +250,6 @@ impl Server {
         }
         Ok(())
     }
-    // TODO(design): Each connection gets its own isolated BrokerClient queue. Enqueue from client A
-    // only goes into A's queue, and Dequeue from A only reads from A's queue. This makes it a
-    // per-connection buffer, not a message broker. For real pub/sub or work-queue semantics you need
-    // a shared global queue (or named topic map) that is independent of individual connections.
     async fn handle_connection(&self, stream: TcpStream, stop_word: Arc<Notify>) {
         self.active_connections.fetch_add(1, Relaxed);
         if let Err(err) = self.clone().read_buffer(stream, stop_word.clone()).await {
@@ -279,8 +261,8 @@ impl Server {
         println!("New connection from {}", addr);
         pool.spawn(async move { self.handle_connection(socket, stop_word.clone()).await }).await
     }
-    async fn send_message(self, stream: Arc<Mutex<OwnedWriteHalf>>, queue_name: String, client_id: u16) -> Result<(), std::io::Error> {
-        if let Some(queue) = self.queue.get(&queue_name) {
+    async fn send_message(self, stream: Arc<Mutex<OwnedWriteHalf>>, queue_name: String, client_id: u128) -> Result<(), std::io::Error> {
+        if let Some(queue) = self.queue.read().await.get(&queue_name) {
             let message = queue.lock().await.lock_to_read(client_id);
             match message {
                 Ok(message) => {
@@ -295,8 +277,8 @@ impl Server {
         }
         Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Failed to send message"))
     }
-    async fn clear_message_sent(self, queue_name: String, client_id: u16, message_id: Option<u128>) -> Result<(), std::io::Error> {
-        if let Some(queue) = self.queue.get(&queue_name)
+    async fn clear_message_sent(self, queue_name: String, client_id: u128, message_id: Option<u128>) -> Result<(), std::io::Error> {
+        if let Some(queue) = self.queue.read().await.get(&queue_name)
         {
             let cleared = queue.lock().await.dequeue(client_id, message_id);
             match cleared {
@@ -336,12 +318,13 @@ impl Server {
 
             if buffer.len() >= COMMAND_SIZE + CLIENT_ID_SIZE + PAYLOAD_SIZE {
                 let command = Request::from_u8(buffer[0])?;
-                let client_id = u16::from_be_bytes(buffer[COMMAND_SIZE..(COMMAND_SIZE+CLIENT_ID_SIZE)].try_into().unwrap());
+                let client_id = u128::from_be_bytes(buffer[COMMAND_SIZE..(COMMAND_SIZE+CLIENT_ID_SIZE)].try_into().unwrap());
                 let payload_size = u64::from_be_bytes(buffer[(COMMAND_SIZE+CLIENT_ID_SIZE)..(COMMAND_SIZE+CLIENT_ID_SIZE+PAYLOAD_SIZE)].try_into().unwrap());
                 if buffer.len() < payload_size as usize + (COMMAND_SIZE+CLIENT_ID_SIZE+PAYLOAD_SIZE+QUEUE_NAME_SIZE) {
                     continue;
                 }
-                let queue_name = String::from_utf8(buffer[(COMMAND_SIZE+CLIENT_ID_SIZE+PAYLOAD_SIZE)..(COMMAND_SIZE+CLIENT_ID_SIZE+PAYLOAD_SIZE+QUEUE_NAME_SIZE)].try_into().unwrap());
+                let queue_name = String::from_utf8(buffer[(COMMAND_SIZE+CLIENT_ID_SIZE+PAYLOAD_SIZE)..(COMMAND_SIZE+CLIENT_ID_SIZE+PAYLOAD_SIZE+QUEUE_NAME_SIZE)].try_into().unwrap())
+                    .map(|s| s.trim_end_matches('\0').to_string());
                 let message = RequestMessage::new(&command, buffer.split_to((COMMAND_SIZE+CLIENT_ID_SIZE+PAYLOAD_SIZE+QUEUE_NAME_SIZE) + payload_size as usize));
 
                 let queue_name = queue_name.unwrap_or_else(|err| {
@@ -365,7 +348,7 @@ impl Server {
                                     return;
                                 }
                             };
-                            if let Some(queue) = server.queue.get(&queue_name) {
+                            if let Some(queue) = server.queue.read().await.get(&queue_name) {
                                 match queue.lock().await.enqueue(message.payload, client_id) {
                                     Ok(_) => {
                                         let response = ResponseMessage::new(Response::Succeeded, vec!());
@@ -395,7 +378,7 @@ impl Server {
                     }
                     Request::CreateQ => {
                         let server = self.clone();
-                        if self.queue.contains_key(&queue_name) {
+                        if self.queue.read().await.contains_key(&queue_name) {
                             tokio::spawn(async move {
                                 let response = ResponseMessage::new(Response::Failed, vec!());
                                 server.send_response(writer, &response).await;
@@ -404,7 +387,7 @@ impl Server {
                         }
                         else
                         {
-                            self.queue.insert(queue_name, Arc::new(Mutex::new(Queue::new())));
+                            self.queue.write().await.insert(queue_name, Arc::new(Mutex::new(Queue::new())));
                             tokio::spawn(async move {
                                 let response = ResponseMessage::new(Response::Succeeded, vec!());
                                 server.send_response(writer, &response).await;
@@ -413,8 +396,8 @@ impl Server {
                     }
                     Request::DeleteQ => {
                         let server = self.clone();
-                        if self.queue.contains_key(&queue_name) {
-                            self.queue.remove(&queue_name);
+                        if self.queue.read().await.contains_key(&queue_name) {
+                            self.queue.write().await.remove(&queue_name);
                             tokio::spawn(async move {
                                 let response = ResponseMessage::new(Response::Succeeded, vec!());
                                 server.send_response(writer, &response).await;
@@ -430,8 +413,8 @@ impl Server {
                     }
                     Request::PeekM => {
                         let server = self.clone();
-                        if self.queue.contains_key(&queue_name) {
-                            let list = self.queue.get(&queue_name).unwrap().lock().await.list_messages();
+                        if self.queue.read().await.contains_key(&queue_name) {
+                            let list = self.queue.read().await.get(&queue_name).unwrap().lock().await.list_messages();
                             let list = list.unwrap_or_else(|err| { println!("[worker {:?}] {}", std::thread::current().id(), err); vec!() });
                             tokio::spawn(async move {
                                 let mut result: Vec<u8> = vec!();
@@ -464,7 +447,7 @@ impl Server {
                                     return;
                                 }
                             };
-                            if let Some(queue) = server.queue.get(&queue_name) {
+                            if let Some(queue) = server.queue.read().await.get(&queue_name) {
                                 if payload_size != 16 {
                                     let response = ResponseMessage::new(Response::Failed, vec!());
                                     server.clone().send_response(writer, &response).await;
@@ -490,7 +473,7 @@ impl Server {
                     Request::Succeeded => {
                         let server = self.clone();
                         tokio::spawn(async move {
-                            if let Some(queue) = server.queue.get(&queue_name) {
+                            if let Some(queue) = server.queue.read().await.get(&queue_name) {
                                 match queue.lock().await.dequeue(client_id, None) {
                                     Ok(_) => {
                                         let response = ResponseMessage::new(Response::Succeeded, vec!());
@@ -508,7 +491,7 @@ impl Server {
                     Request::Failed => {
                         let server = self.clone();
                         tokio::spawn(async move {
-                           if let Some(queue) = server.queue.get(&queue_name) {
+                           if let Some(queue) = server.queue.read().await.get(&queue_name) {
                                match queue.lock().await.unlock(client_id) {
                                    Ok(_) => {
                                        let response = ResponseMessage::new(Response::Succeeded, vec!());
@@ -524,10 +507,12 @@ impl Server {
                         });
                     }
                     Request::Requeue => {
-
+                        // TODO(bug): No response is sent to the client. It will wait indefinitely.
+                        // At minimum, send Response::Failed until this is implemented.
                     }
                     Request::UpdateM => {
-
+                        // TODO(bug): No response is sent to the client. It will wait indefinitely.
+                        // At minimum, send Response::Failed until this is implemented.
                     }
                 }
             }
