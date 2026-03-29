@@ -60,6 +60,14 @@ impl Meta {
             locked_by,
         }
     }
+    pub fn to_be_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.append(&mut self.id.to_be_bytes().to_vec());
+        bytes.append(&mut self.publisher_id.to_be_bytes().to_vec());
+        bytes.append(&mut self.timestamp.to_be_bytes().to_vec());
+        bytes.append(&mut self.locked_by.unwrap().to_be_bytes().to_vec());
+        bytes
+    }
 }
 impl Queue {
     pub fn new() -> Self {
@@ -84,7 +92,7 @@ impl Queue {
         }
         self.order.push(id);
         self.queue.insert(id, QueueMessage::new(payload, publisher_id));
-        
+
         Ok(())
     }
     pub fn lock_to_read(&mut self, client_id: u16) -> Result<Vec<u8>, std::io::Error> {

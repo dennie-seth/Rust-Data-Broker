@@ -230,6 +230,9 @@ impl Server {
         let pool = Arc::new(Pool::new(
             config.threads_limit as usize,
             config.wait_limit as usize)?);
+        for queue_name in config.queue_names {
+            self.queue.insert(queue_name, Arc::new(Mutex::new(Queue::new())));
+        }
         {
             loop {
                 tokio::select! {
@@ -335,7 +338,7 @@ impl Server {
                 let command = Request::from_u8(buffer[0])?;
                 let client_id = u16::from_be_bytes(buffer[COMMAND_SIZE..(COMMAND_SIZE+CLIENT_ID_SIZE)].try_into().unwrap());
                 let payload_size = u64::from_be_bytes(buffer[(COMMAND_SIZE+CLIENT_ID_SIZE)..(COMMAND_SIZE+CLIENT_ID_SIZE+PAYLOAD_SIZE)].try_into().unwrap());
-                if buffer.len() < payload_size as usize + (COMMAND_SIZE+CLIENT_ID_SIZE+PAYLOAD_SIZE) {
+                if buffer.len() < payload_size as usize + (COMMAND_SIZE+CLIENT_ID_SIZE+PAYLOAD_SIZE+QUEUE_NAME_SIZE) {
                     continue;
                 }
                 let queue_name = String::from_utf8(buffer[(COMMAND_SIZE+CLIENT_ID_SIZE+PAYLOAD_SIZE)..(COMMAND_SIZE+CLIENT_ID_SIZE+PAYLOAD_SIZE+QUEUE_NAME_SIZE)].try_into().unwrap());
@@ -345,11 +348,12 @@ impl Server {
                     println!("[worker {:?}] queue name error {:?}", std::thread::current().id(), err);
                     "".to_string()
                 });
+
+                let writer = stream_write.clone();
+
                 match command {
                     Request::Enqueue => {
-                        let writer = stream_write.clone();
                         let server = self.clone();
-
                         tokio::spawn(async move {
                             let message = match message
                             {
@@ -377,9 +381,7 @@ impl Server {
                         });
                     }
                     Request::Dequeue => {
-                        let writer = stream_write.clone();
                         let server = self.clone();
-
                         tokio::spawn(async move {
                             match server.clone().send_message(writer.clone(), queue_name, client_id).await {
                                 Ok(_) => {},
@@ -392,22 +394,134 @@ impl Server {
                         });
                     }
                     Request::CreateQ => {
-
+                        let server = self.clone();
+                        if self.queue.contains_key(&queue_name) {
+                            tokio::spawn(async move {
+                                let response = ResponseMessage::new(Response::Failed, vec!());
+                                server.send_response(writer, &response).await;
+                                println!("Queue already created!");
+                            });
+                        }
+                        else
+                        {
+                            self.queue.insert(queue_name, Arc::new(Mutex::new(Queue::new())));
+                            tokio::spawn(async move {
+                                let response = ResponseMessage::new(Response::Succeeded, vec!());
+                                server.send_response(writer, &response).await;
+                            });
+                        }
                     }
                     Request::DeleteQ => {
-
+                        let server = self.clone();
+                        if self.queue.contains_key(&queue_name) {
+                            self.queue.remove(&queue_name);
+                            tokio::spawn(async move {
+                                let response = ResponseMessage::new(Response::Succeeded, vec!());
+                                server.send_response(writer, &response).await;
+                            });
+                        }
+                        else {
+                            tokio::spawn(async move {
+                                let response = ResponseMessage::new(Response::Failed, vec!());
+                                server.send_response(writer, &response).await;
+                                println!("Queue does not exist!");
+                            });
+                        }
                     }
                     Request::PeekM => {
-
+                        let server = self.clone();
+                        if self.queue.contains_key(&queue_name) {
+                            let list = self.queue.get(&queue_name).unwrap().lock().await.list_messages();
+                            let list = list.unwrap_or_else(|err| { println!("[worker {:?}] {}", std::thread::current().id(), err); vec!() });
+                            tokio::spawn(async move {
+                                let mut result: Vec<u8> = vec!();
+                                for message in list {
+                                    result.append(&mut message.to_be_bytes());
+                                }
+                                if result.len() > 0 {
+                                    let response = ResponseMessage::new(Response::Succeeded, result);
+                                    server.send_response(writer, &response).await;
+                                }
+                                else {
+                                    let response = ResponseMessage::new(Response::Failed, vec!());
+                                    server.send_response(writer, &response).await;
+                                    println!("Queue {queue_name} is empty!")
+                                }
+                            });
+                        }
                     }
                     Request::DeleteM => {
-
+                        let server = self.clone();
+                        tokio::spawn(async move
+                        {
+                            let message = match message
+                            {
+                                Ok(message) => message,
+                                Err(err) => {
+                                    let response = ResponseMessage::new(Response::Failed, vec!());
+                                    server.send_response(writer, &response).await;
+                                    println!("[worker {:?}] parse_message error {:?}", std::thread::current().id(), err);
+                                    return;
+                                }
+                            };
+                            if let Some(queue) = server.queue.get(&queue_name) {
+                                if payload_size != 16 {
+                                    let response = ResponseMessage::new(Response::Failed, vec!());
+                                    server.clone().send_response(writer, &response).await;
+                                    println!("Payload doesn't contain message_id!");
+                                    return;
+                                }
+                                let bytes: [u8; 16] = message.payload.as_slice().try_into().unwrap();
+                                let message_id = u128::from_be_bytes(bytes);
+                                match queue.lock().await.dequeue(client_id, Some(message_id)) {
+                                    Ok(_) => {
+                                        let response = ResponseMessage::new(Response::Succeeded, vec!());
+                                        server.clone().send_response(writer, &response).await;
+                                    }
+                                    Err(err) => {
+                                        let response = ResponseMessage::new(Response::Failed, vec!());
+                                        server.clone().send_response(writer, &response).await;
+                                        println!("[worker {:?}] delete message error {:?}", std::thread::current().id(), err);
+                                    }
+                                }
+                            }
+                        });
                     }
                     Request::Succeeded => {
-
+                        let server = self.clone();
+                        tokio::spawn(async move {
+                            if let Some(queue) = server.queue.get(&queue_name) {
+                                match queue.lock().await.dequeue(client_id, None) {
+                                    Ok(_) => {
+                                        let response = ResponseMessage::new(Response::Succeeded, vec!());
+                                        server.clone().send_response(writer, &response).await;
+                                    }
+                                    Err(err) => {
+                                        let response = ResponseMessage::new(Response::Failed, vec!());
+                                        server.clone().send_response(writer, &response).await;
+                                        println!("[worker {:?}] delete message error {:?}", std::thread::current().id(), err);
+                                    }
+                                }
+                            }
+                        });
                     }
                     Request::Failed => {
-
+                        let server = self.clone();
+                        tokio::spawn(async move {
+                           if let Some(queue) = server.queue.get(&queue_name) {
+                               match queue.lock().await.unlock(client_id) {
+                                   Ok(_) => {
+                                       let response = ResponseMessage::new(Response::Succeeded, vec!());
+                                       server.clone().send_response(writer, &response).await;
+                                   }
+                                   Err(err) => {
+                                       let response = ResponseMessage::new(Response::Failed, vec!());
+                                       server.clone().send_response(writer, &response).await;
+                                       println!("[worker {:?}] unlock message error {:?}", std::thread::current().id(), err);
+                                   }
+                               }
+                           }
+                        });
                     }
                     Request::Requeue => {
 
