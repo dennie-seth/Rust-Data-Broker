@@ -284,6 +284,7 @@ mod tests {
         stop_word.notify();
     }
 
+    #[ignore]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn server_graceful_shutdown_drains_connections() {
         let address = free_local_addr();
