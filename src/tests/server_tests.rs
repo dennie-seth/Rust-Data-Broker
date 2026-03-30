@@ -1,5 +1,6 @@
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::net::{Ipv4Addr, SocketAddrV4};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -289,23 +290,43 @@ mod tests {
         let drained = Arc::new(Notify::new());
         let (stop_word, stop_accepting) =
             start_server(make_config(address), drained.clone()).unwrap();
-        tokio::time::sleep(Duration::from_millis(50)).await;
 
-        let client = TcpStream::connect(address).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        // Spawn the real shutdown loop from main.rs — no logic is duplicated here.
+        // It handles the ctrl+c signal internally and drives stop_accepting / stop_word.
+        let mut env_args = HashMap::new();
+        env_args.insert("--shutdown_timeout".to_string(), "30".to_string());
+        let drained_for_loop = drained.clone();
+        tokio::spawn(async move {
+            crate::run_shutdown_loop(stop_word, stop_accepting, drained_for_loop, env_args)
+                .await.unwrap();
+        });
 
-        // Spawn the drain waiter before signalling shutdown so it is registered
-        // before notify_waiters() fires on the drained Notify.
+        tokio::time::sleep(Duration::from_millis(50)).await; // let server start and ctrl_c() register
+
+        // Register drain waiter before sending the signal so it catches the notification.
         let drained_clone = drained.clone();
         let drain_waiter = tokio::spawn(async move { drained_clone.notified().await });
         tokio::time::sleep(Duration::from_millis(5)).await;
 
-        stop_accepting.notify(); // stop accepting new connections
-        stop_word.notify();      // stop active connections
-        drop(client);            // close client side so read_buffer returns immediately
+        send_ctrl_c();
 
-        timeout(Duration::from_secs(2), drain_waiter)
-            .await.expect("server did not drain within timeout")
+        timeout(Duration::from_secs(30), drain_waiter)
+            .await.expect("server did not drain within 30 seconds")
             .unwrap();
+    }
+
+    fn send_ctrl_c() {
+        #[cfg(windows)]
+        unsafe extern "system" {
+            fn GenerateConsoleCtrlEvent(dwCtrlEvent: u32, dwProcessGroupId: u32) -> i32;
+        }
+        #[cfg(windows)]
+        unsafe { GenerateConsoleCtrlEvent(0, 0); }
+        #[cfg(unix)]
+        unsafe extern "C" {
+            fn raise(sig: i32) -> i32;
+        }
+        #[cfg(unix)]
+        unsafe { raise(2); } // SIGINT
     }
 }

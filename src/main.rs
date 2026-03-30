@@ -41,6 +41,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // endregion
 
     // region: main app loop
+    run_shutdown_loop(stop_word, stop_accepting, drained, env_args).await?;
+    // endregion
+    Ok(())
+}
+
+pub(crate) async fn run_shutdown_loop(
+    stop_word: Arc<Notify>,
+    stop_accepting: Arc<Notify>,
+    drained: Arc<Notify>,
+    env_args: HashMap<String, String>,
+) -> Result<(), Box<dyn std::error::Error>> {
     loop {
         tokio::select! {
             _ = stop_word.notified() => { break; },
@@ -49,11 +60,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ShutdownReason::CtrlC => {
                         println!("Shutting down...");
                         shutdown(&stop_accepting, &stop_word, &drained, &env_args).await?;
+                        break;
                     }
                     #[cfg(unix)]
                     ShutdownReason::SigTerm => {
                         println!("SigTerm received, gracefully shutting down...");
                         shutdown(&stop_accepting, &stop_word, &drained, &env_args).await?;
+                        break;
                     }
                     #[cfg(unix)]
                     ShutdownReason::SigHup => {
@@ -63,7 +76,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
-    // endregion
     Ok(())
 }
 #[derive(Debug)]
