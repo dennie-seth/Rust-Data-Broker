@@ -319,9 +319,15 @@ mod tests {
         #[cfg(windows)]
         unsafe extern "system" {
             fn GenerateConsoleCtrlEvent(dwCtrlEvent: u32, dwProcessGroupId: u32) -> i32;
+            fn SetConsoleCtrlHandler(HandlerRoutine: *const core::ffi::c_void, Add: i32) -> i32;
         }
         #[cfg(windows)]
-        unsafe { GenerateConsoleCtrlEvent(0, 0); }
+        unsafe {
+            SetConsoleCtrlHandler(std::ptr::null(), 1);  // ignore ctrl+c in test runner
+            GenerateConsoleCtrlEvent(0, 0);
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            SetConsoleCtrlHandler(std::ptr::null(), 0);  // restore default handling
+        }
         #[cfg(unix)]
         unsafe extern "C" {
             fn raise(sig: i32) -> i32;
