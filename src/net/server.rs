@@ -421,14 +421,9 @@ impl Server {
                                 for message in list {
                                     result.append(&mut message.to_be_bytes());
                                 }
-                                if result.len() > 0 {
+                                {
                                     let response = ResponseMessage::new(Response::Succeeded, result);
                                     server.send_response(writer, &response).await;
-                                }
-                                else {
-                                    let response = ResponseMessage::new(Response::Failed, vec!());
-                                    server.send_response(writer, &response).await;
-                                    println!("Queue {queue_name} is empty!")
                                 }
                             });
                         }
@@ -507,12 +502,13 @@ impl Server {
                         });
                     }
                     Request::Requeue => {
-                        // TODO(bug): No response is sent to the client. It will wait indefinitely.
-                        // At minimum, send Response::Failed until this is implemented.
+                        let server = self.clone();
+                        tokio::spawn(async move {
+                            
+                        });
                     }
                     Request::UpdateM => {
-                        // TODO(bug): No response is sent to the client. It will wait indefinitely.
-                        // At minimum, send Response::Failed until this is implemented.
+
                     }
                 }
             }
