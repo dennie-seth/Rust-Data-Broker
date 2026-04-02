@@ -248,7 +248,8 @@ mod tests {
         client.write_all(&encode_request(2, 1, "myqueue", &[])).await.unwrap();
         let response = read_response(&mut client).await;
         assert_eq!(response[0], 1, "Dequeue: expected Succeeded");
-        assert_eq!(&response[9..], payload, "Dequeue: payload mismatch");
+        // Meta is prepended: [16 id][16 publisher_id][8 timestamp][16 locked_by] = 56 bytes
+        assert_eq!(&response[9 + 56..], payload, "Dequeue: payload mismatch");
 
         stop_word.notify();
     }
@@ -280,6 +281,223 @@ mod tests {
             }));
         }
         for h in handles { h.await.unwrap(); }
+
+        stop_word.notify();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn server_delete_queue_responds_success() {
+        let address = free_local_addr();
+        let drained = Arc::new(Notify::new());
+        let (stop_word, _) = start_server(make_config(address), drained).unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut client = TcpStream::connect(address).await.unwrap();
+
+        client.write_all(&encode_request(3, 1, "delq", &[])).await.unwrap();
+        let response = read_response(&mut client).await;
+        assert_eq!(response[0], 1, "CreateQ: expected Succeeded");
+
+        client.write_all(&encode_request(4, 1, "delq", &[])).await.unwrap();
+        let response = read_response(&mut client).await;
+        assert_eq!(response[0], 1, "DeleteQ: expected Succeeded");
+
+        stop_word.notify();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn server_delete_queue_nonexistent_responds_failure() {
+        let address = free_local_addr();
+        let drained = Arc::new(Notify::new());
+        let (stop_word, _) = start_server(make_config(address), drained).unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut client = TcpStream::connect(address).await.unwrap();
+
+        client.write_all(&encode_request(4, 1, "noqueue", &[])).await.unwrap();
+        let response = read_response(&mut client).await;
+        assert_eq!(response[0], 2, "DeleteQ nonexistent: expected Failed");
+
+        stop_word.notify();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn server_list_messages_returns_metadata() {
+        let address = free_local_addr();
+        let drained = Arc::new(Notify::new());
+        let (stop_word, _) = start_server(make_config(address), drained).unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut client = TcpStream::connect(address).await.unwrap();
+
+        client.write_all(&encode_request(3, 1, "listq", &[])).await.unwrap();
+        let response = read_response(&mut client).await;
+        assert_eq!(response[0], 1, "CreateQ: expected Succeeded");
+
+        client.write_all(&encode_request(1, 1, "listq", b"msg1")).await.unwrap();
+        let response = read_response(&mut client).await;
+        assert_eq!(response[0], 1, "Enqueue 1: expected Succeeded");
+
+        client.write_all(&encode_request(1, 1, "listq", b"msg2")).await.unwrap();
+        let response = read_response(&mut client).await;
+        assert_eq!(response[0], 1, "Enqueue 2: expected Succeeded");
+
+        // ListM = 5
+        client.write_all(&encode_request(5, 1, "listq", &[])).await.unwrap();
+        let response = read_response(&mut client).await;
+        assert_eq!(response[0], 1, "ListM: expected Succeeded");
+        // Each Meta entry is 56 bytes (16 id + 16 publisher_id + 8 timestamp + 16 locked_by)
+        let payload = &response[9..];
+        assert_eq!(payload.len() % 56, 0, "ListM payload should be multiple of 56 bytes");
+        assert_eq!(payload.len() / 56, 2, "ListM should return 2 entries");
+
+        stop_word.notify();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn server_succeeded_acks_message() {
+        let address = free_local_addr();
+        let drained = Arc::new(Notify::new());
+        let (stop_word, _) = start_server(make_config(address), drained).unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut client = TcpStream::connect(address).await.unwrap();
+
+        client.write_all(&encode_request(3, 1, "ackq", &[])).await.unwrap();
+        let response = read_response(&mut client).await;
+        assert_eq!(response[0], 1, "CreateQ: expected Succeeded");
+
+        client.write_all(&encode_request(1, 1, "ackq", b"hello")).await.unwrap();
+        let response = read_response(&mut client).await;
+        assert_eq!(response[0], 1, "Enqueue: expected Succeeded");
+
+        // Dequeue locks the message to client 1
+        client.write_all(&encode_request(2, 1, "ackq", &[])).await.unwrap();
+        let response = read_response(&mut client).await;
+        assert_eq!(response[0], 1, "Dequeue: expected Succeeded");
+
+        // Succeeded (7) acks the locked message
+        client.write_all(&encode_request(7, 1, "ackq", &[])).await.unwrap();
+        let response = read_response(&mut client).await;
+        assert_eq!(response[0], 1, "Succeeded: expected Succeeded");
+
+        // Queue should now be empty — dequeue again should fail
+        client.write_all(&encode_request(2, 1, "ackq", &[])).await.unwrap();
+        let response = read_response(&mut client).await;
+        assert_eq!(response[0], 2, "Dequeue after ack: expected Failed (empty)");
+
+        stop_word.notify();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn server_failed_nacks_and_unlocks_message() {
+        let address = free_local_addr();
+        let drained = Arc::new(Notify::new());
+        let (stop_word, _) = start_server(make_config(address), drained).unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut client = TcpStream::connect(address).await.unwrap();
+
+        client.write_all(&encode_request(3, 1, "nackq", &[])).await.unwrap();
+        let response = read_response(&mut client).await;
+        assert_eq!(response[0], 1, "CreateQ: expected Succeeded");
+
+        client.write_all(&encode_request(1, 1, "nackq", b"retry me")).await.unwrap();
+        let response = read_response(&mut client).await;
+        assert_eq!(response[0], 1, "Enqueue: expected Succeeded");
+
+        // Dequeue locks the message to client 1
+        client.write_all(&encode_request(2, 1, "nackq", &[])).await.unwrap();
+        let response = read_response(&mut client).await;
+        assert_eq!(response[0], 1, "Dequeue: expected Succeeded");
+
+        // Failed (8) nacks — unlocks the message
+        client.write_all(&encode_request(8, 1, "nackq", &[])).await.unwrap();
+        let response = read_response(&mut client).await;
+        assert_eq!(response[0], 1, "Failed: expected Succeeded");
+
+        // Message should be available again — dequeue should succeed
+        client.write_all(&encode_request(2, 1, "nackq", &[])).await.unwrap();
+        let response = read_response(&mut client).await;
+        assert_eq!(response[0], 1, "Dequeue after nack: expected Succeeded");
+        assert_eq!(&response[9 + 56..], b"retry me", "payload should match original");
+
+        stop_word.notify();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn server_delete_message_by_id() {
+        let address = free_local_addr();
+        let drained = Arc::new(Notify::new());
+        let (stop_word, _) = start_server(make_config(address), drained).unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut client = TcpStream::connect(address).await.unwrap();
+
+        client.write_all(&encode_request(3, 1, "delmq", &[])).await.unwrap();
+        let response = read_response(&mut client).await;
+        assert_eq!(response[0], 1, "CreateQ: expected Succeeded");
+
+        client.write_all(&encode_request(1, 1, "delmq", b"to delete")).await.unwrap();
+        let response = read_response(&mut client).await;
+        assert_eq!(response[0], 1, "Enqueue: expected Succeeded");
+
+        // Dequeue to get the message ID from meta
+        client.write_all(&encode_request(2, 1, "delmq", &[])).await.unwrap();
+        let response = read_response(&mut client).await;
+        assert_eq!(response[0], 1, "Dequeue: expected Succeeded");
+        let message_id = &response[9..9 + 16]; // first 16 bytes of meta = message ID
+
+        // DeleteM (6) with message_id as payload
+        client.write_all(&encode_request(6, 1, "delmq", message_id)).await.unwrap();
+        let response = read_response(&mut client).await;
+        assert_eq!(response[0], 1, "DeleteM: expected Succeeded");
+
+        // Queue should now be empty
+        client.write_all(&encode_request(2, 1, "delmq", &[])).await.unwrap();
+        let response = read_response(&mut client).await;
+        assert_eq!(response[0], 2, "Dequeue after delete: expected Failed (empty)");
+
+        stop_word.notify();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn server_requeue_moves_message_to_end() {
+        let address = free_local_addr();
+        let drained = Arc::new(Notify::new());
+        let (stop_word, _) = start_server(make_config(address), drained).unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut client = TcpStream::connect(address).await.unwrap();
+
+        client.write_all(&encode_request(3, 1, "reqq", &[])).await.unwrap();
+        let response = read_response(&mut client).await;
+        assert_eq!(response[0], 1, "CreateQ: expected Succeeded");
+
+        client.write_all(&encode_request(1, 1, "reqq", b"first")).await.unwrap();
+        let response = read_response(&mut client).await;
+        assert_eq!(response[0], 1, "Enqueue 1: expected Succeeded");
+
+        client.write_all(&encode_request(1, 1, "reqq", b"second")).await.unwrap();
+        let response = read_response(&mut client).await;
+        assert_eq!(response[0], 1, "Enqueue 2: expected Succeeded");
+
+        // Dequeue to get first message ID
+        client.write_all(&encode_request(2, 1, "reqq", &[])).await.unwrap();
+        let response = read_response(&mut client).await;
+        assert_eq!(response[0], 1, "Dequeue: expected Succeeded");
+        let first_msg_id = response[9..9 + 16].to_vec();
+
+        // Requeue (9) the first message — payload is the 16-byte message ID
+        client.write_all(&encode_request(9, 1, "reqq", &first_msg_id)).await.unwrap();
+        let response = read_response(&mut client).await;
+        assert_eq!(response[0], 1, "Requeue: expected Succeeded");
+
+        // Next dequeue should return "second" (the original second message)
+        client.write_all(&encode_request(2, 1, "reqq", &[])).await.unwrap();
+        let response = read_response(&mut client).await;
+        assert_eq!(response[0], 1, "Dequeue after requeue: expected Succeeded");
+        assert_eq!(&response[9 + 56..], b"second", "should get 'second' next");
 
         stop_word.notify();
     }

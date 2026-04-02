@@ -203,6 +203,28 @@ impl Queue {
         }
         Ok(())
     }
+    pub fn requeue(&mut self, client_id: u128, message_id: u128) -> Result<(), std::io::Error> {
+        if self.order.is_empty() {
+            return Err(std::io::Error::new(ErrorKind::InvalidData, "Queue is empty"));
+        }
+        if !self.queue.contains_key(&message_id) {
+            return Err(std::io::Error::new(ErrorKind::InvalidData, "Message is not in queue"));
+        }
+        match self.queue.get(&message_id) {
+            Some(message) => {
+                let payload = message.payload.to_owned();
+                let publisher_id = message.publisher_id;
+
+                self.enqueue(payload, publisher_id)?;
+                self.dequeue(client_id, Some(message_id))?;
+            }
+            None => {
+                return Err(std::io::Error::new(ErrorKind::InvalidData, "Message is not in queue"));
+            }
+        }
+
+        Ok(())
+    }
     pub fn list_messages(&self) -> Result<Vec<Meta>, std::io::Error> {
         let mut result = Vec::<Meta>::with_capacity(self.queue.len());
         for (key, value) in self.queue.iter() {

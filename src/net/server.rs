@@ -113,7 +113,7 @@ pub(crate) enum Request {
     Dequeue = 2,
     CreateQ = 3,
     DeleteQ = 4,
-    PeekM = 5,
+    ListM = 5,
     DeleteM = 6,
     Succeeded = 7,
     Failed = 8,
@@ -127,7 +127,7 @@ impl Request {
             2 => Ok(Request::Dequeue),
             3 => Ok(Request::CreateQ),
             4 => Ok(Request::DeleteQ),
-            5 => Ok(Request::PeekM),
+            5 => Ok(Request::ListM),
             6 => Ok(Request::DeleteM),
             7 => Ok(Request::Succeeded),
             8 => Ok(Request::Failed),
@@ -411,12 +411,15 @@ impl Server {
                             });
                         }
                     }
-                    Request::PeekM => {
+                    Request::ListM => {
                         let server = self.clone();
-                        if self.queue.read().await.contains_key(&queue_name) {
-                            let list = self.queue.read().await.get(&queue_name).unwrap().lock().await.list_messages();
-                            let list = list.unwrap_or_else(|err| { println!("[worker {:?}] {}", std::thread::current().id(), err); vec!() });
-                            tokio::spawn(async move {
+                        tokio::spawn(async move {
+                            if server.queue.read().await.contains_key(&queue_name) {
+                                let list = server.queue.read().await.get(&queue_name).unwrap().lock().await.list_messages();
+                                let list = list.unwrap_or_else(|err| {
+                                    println!("[worker {:?}] {}", std::thread::current().id(), err);
+                                    vec!()
+                                });
                                 let mut result: Vec<u8> = vec!();
                                 for message in list {
                                     result.append(&mut message.to_be_bytes());
@@ -425,8 +428,8 @@ impl Server {
                                     let response = ResponseMessage::new(Response::Succeeded, result);
                                     server.send_response(writer, &response).await;
                                 }
-                            });
-                        }
+                            }
+                        });
                     }
                     Request::DeleteM => {
                         let server = self.clone();
@@ -477,7 +480,7 @@ impl Server {
                                     Err(err) => {
                                         let response = ResponseMessage::new(Response::Failed, vec!());
                                         server.clone().send_response(writer, &response).await;
-                                        println!("[worker {:?}] delete message error {:?}", std::thread::current().id(), err);
+                                        println!("[worker {:?}] dequeue message error {:?}", std::thread::current().id(), err);
                                     }
                                 }
                             }
@@ -504,7 +507,36 @@ impl Server {
                     Request::Requeue => {
                         let server = self.clone();
                         tokio::spawn(async move {
-                            
+                            let message = match message {
+                                Ok(message) => message,
+                                Err(err) => {
+                                    let response = ResponseMessage::new(Response::Failed, vec!());
+                                    server.send_response(writer, &response).await;
+                                    println!("[worker {:?}] parse_message error {:?}", std::thread::current().id(), err);
+                                    return;
+                                }
+                            };
+                            if let Some(queue) = server.queue.read().await.get(&queue_name) {
+                                if payload_size != 16 {
+                                    let response = ResponseMessage::new(Response::Failed, vec!());
+                                    server.clone().send_response(writer, &response).await;
+                                    println!("Payload doesn't contain message_id!");
+                                    return;
+                                }
+                                let bytes: [u8; 16] = message.payload.as_slice().try_into().unwrap();
+                                let message_id = u128::from_be_bytes(bytes);
+                                match queue.lock().await.requeue(client_id, message_id) {
+                                    Ok(_) => {
+                                        let response = ResponseMessage::new(Response::Succeeded, vec!());
+                                        server.clone().send_response(writer, &response).await;
+                                    }
+                                    Err(err) => {
+                                        let response = ResponseMessage::new(Response::Failed, vec!());
+                                        server.clone().send_response(writer, &response).await;
+                                        println!("[worker {:?}] delete message error {:?}", std::thread::current().id(), err);
+                                    }
+                                }
+                            }
                         });
                     }
                     Request::UpdateM => {
