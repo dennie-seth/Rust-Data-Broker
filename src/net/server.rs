@@ -11,6 +11,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, RwLock};
 use bytes::BytesMut;
 use tokio::net::tcp::OwnedWriteHalf;
+use uuid::Uuid;
 use crate::config::Config;
 use crate::net::queue::Queue;
 
@@ -155,7 +156,8 @@ impl Response {
 #[derive(Debug, Clone)]
 pub(crate) struct Server {
     addr: Addr,
-    queue: Arc<RwLock<HashMap<String, Arc<Mutex<Queue>>>>>,
+    queue: Arc<RwLock<HashMap<Uuid, Arc<Mutex<Queue>>>>>,
+    queue_names: Arc<RwLock<HashMap<String, Uuid>>>,
     stop_word: Arc<Notify>,
     stop_accepting: Arc<Notify>,
     active_connections: Arc<AtomicUsize>,
@@ -208,6 +210,7 @@ impl Server {
             stop_word,
             stop_accepting,
             active_connections: Arc::new(AtomicUsize::new(0_usize)),
+            queue_names: Arc::new(RwLock::new(HashMap::new())),
         }
     }
     pub(crate) async fn run(&mut self, config: Config, drained: &Arc<Notify>) -> Result<(), std::io::Error> {
@@ -217,7 +220,9 @@ impl Server {
             config.threads_limit as usize,
             config.wait_limit as usize)?);
         for queue_name in config.queue_names {
-            self.queue.write().await.insert(queue_name, Arc::new(Mutex::new(Queue::new())));
+            let hash = Uuid::new_v4();
+            self.queue_names.write().await.insert(queue_name, hash);
+            self.queue.write().await.insert(hash, Arc::new(Mutex::new(Queue::new())));
         }
         {
             loop {
@@ -261,38 +266,62 @@ impl Server {
         println!("New connection from {}", addr);
         pool.spawn(async move { self.handle_connection(socket, stop_word.clone()).await }).await
     }
+    async fn get_queue(&self, queue_name: &String) -> Result<Arc<Mutex<Queue>>, std::io::Error> {
+        let hash = self.queue_names.read().await.get(queue_name).cloned();
+        match hash {
+            Some(hash) => {
+                let queue = self.queue.read().await.get(&hash).cloned();
+                match queue {
+                    Some(queue) => {
+                        Ok(queue.clone()) },
+                    None => {
+                        Err(std::io::Error::new(std::io::ErrorKind::NotFound, "Queue not found")) },
+                }
+            }
+            None => {
+                Err(std::io::Error::new(std::io::ErrorKind::NotFound, "Hash not found"))
+            }
+        }
+    }
     async fn send_message(self, stream: Arc<Mutex<OwnedWriteHalf>>, queue_name: String, client_id: u128) -> Result<(), std::io::Error> {
-        if let Some(queue) = self.queue.read().await.get(&queue_name) {
-            let message = queue.lock().await.lock_to_read(client_id);
-            match message {
-                Ok(message) => {
-                    let message = ResponseMessage::new(Response::Succeeded, message);
-                    stream.lock().await.write_all(&message.to_u8()).await?;
-                    return Ok(())
+        match self.get_queue(&queue_name).await {
+            Ok(queue) => {
+                let message = queue.lock().await.lock_to_read(client_id);
+                match message {
+                    Ok(message) => {
+                        let message = ResponseMessage::new(Response::Succeeded, message);
+                        stream.lock().await.write_all(&message.to_u8()).await?;
+                        return Ok(())
+                    }
+                    Err(err) => {
+                        println!("[worker {:?}] send_message error {:?}", std::thread::current().id(), err);
+                    }
                 }
-                Err(err) => {
-                    println!("[worker {:?}] send_message error {:?}", std::thread::current().id(), err);
-                }
+            }
+            Err(err) => {
+                println!("[worker {:?}] send_message error {:?}", std::thread::current().id(), err);
             }
         }
         Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Failed to send message"))
     }
     async fn clear_message_sent(self, queue_name: String, client_id: u128, message_id: Option<u128>) -> Result<(), std::io::Error> {
-        if let Some(queue) = self.queue.read().await.get(&queue_name)
-        {
-            let cleared = queue.lock().await.dequeue(client_id, message_id);
-            match cleared {
-                Ok(_) => {
-                    Ok(())
+        match self.get_queue(&queue_name).await {
+            Ok(queue) => {
+                let cleared = queue.lock().await.dequeue(client_id, message_id);
+                match cleared {
+                    Ok(_) => {
+                        return Ok(())
+                        }
+                    Err(err) => {
+                        return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, err.to_string()))
+                    }
                 }
-                Err(err) => {
-                    Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, err.to_string()))
-                }
+            },
+            Err(err) => {
+                println!("[worker {:?}] clear_message_sent error {:?}", std::thread::current().id(), err);
             }
         }
-        else {
-            Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Queue not found"))
-        }
+        Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Failed to clear message sent"))
     }
     async fn send_response(self, stream: Arc<Mutex<OwnedWriteHalf>>, response: &ResponseMessage) {
         match stream.lock().await.write_all(&response.to_u8()).await {
