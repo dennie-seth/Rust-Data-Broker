@@ -1,5 +1,38 @@
 # Changelog
 
+## [0.3.5] - 2026-04-04
+
+### Features
+- Implemented `UpdateM` command — updates a message's payload by ID (payload = 16-byte message ID + new payload)
+- Implemented `Requeue` command handler in server (queue-side `requeue` already existed)
+
+### Bug Fixes
+- Fixed `UpdateM` payload size check: was `!= 16` (rejecting any update with actual data), now `< 16`
+- Fixed `DeleteM` and `Requeue` payload size checks: moved from `!= 16` to `< 16` for consistency
+
+### Tests
+- Added `server_update_message_changes_payload` — enqueues, updates payload via `UpdateM`, then verifies the new payload on re-dequeue
+- Added `server_update_message_too_short_payload_fails` — verifies `UpdateM` with a payload shorter than 16 bytes returns Failed
+
+### Documentation
+- `CLAUDE.md` updated: `Requeue` and `UpdateM` commands documented as implemented; removed from Known Design Limitations
+
+## [0.3.4] - 2026-04-02
+
+### Bug Fixes
+
+#### Tests
+- Fixed `server_enqueue_then_dequeue_returns_message` — payload assertion offset adjusted from `response[9..]` to `response[9 + 56..]` to account for the 56-byte meta prefix added to dequeue responses in 0.3.4
+
+### Tests
+- Added `server_delete_queue_responds_success` — verifies `DeleteQ` on an existing queue returns Succeeded
+- Added `server_delete_queue_nonexistent_responds_failure` — verifies `DeleteQ` on a missing queue returns Failed
+- Added `server_list_messages_returns_metadata` — verifies `ListM` returns the correct number of 56-byte `Meta` entries
+- Added `server_succeeded_acks_message` — verifies `Succeeded` removes the locked message and the queue is empty afterwards
+- Added `server_failed_nacks_and_unlocks_message` — verifies `Failed` unlocks the message so it can be dequeued again
+- Added `server_delete_message_by_id` — verifies `DeleteM` removes a specific message by its 16-byte ID
+- Added `server_requeue_moves_message_to_end` — verifies `Requeue` moves a message to the back of the queue
+
 ## [0.3.3] - 2026-03-29
 
 ### Bug Fixes

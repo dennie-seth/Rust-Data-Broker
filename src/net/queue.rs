@@ -111,12 +111,15 @@ impl Queue {
             return Err(std::io::Error::new(ErrorKind::InvalidData, "Queue message already locked"));
         }
 
+        let mut head= vec!();
         if let Some(message) = self.queue.get_mut(&self.next_id.unwrap()) {
             message.lock(client_id);
             self.locked.insert(client_id, self.next_id.unwrap());
+            head = get_meta_as_vec(self.next_id.unwrap(), &message);
         }
 
-        let payload = self.queue[&self.next_id.unwrap()].payload.clone();
+        head.append(&mut self.queue[&self.next_id.unwrap()].payload.clone());
+        let payload: Vec<u8> = head;
 
         let mut iter = self.order.iter();
         let _ = iter.find(|&&i| i == self.next_id.unwrap());
@@ -200,6 +203,27 @@ impl Queue {
         }
         Ok(())
     }
+    pub fn requeue(&mut self, client_id: u128, message_id: u128) -> Result<(), std::io::Error> {
+        if self.order.is_empty() {
+            return Err(std::io::Error::new(ErrorKind::InvalidData, "Queue is empty"));
+        }
+        if !self.queue.contains_key(&message_id) {
+            return Err(std::io::Error::new(ErrorKind::InvalidData, "Message is not in queue"));
+        }
+        match self.queue.get(&message_id) {
+            Some(message) => {
+                let payload = message.payload.to_owned();
+                let publisher_id = message.publisher_id;
+
+                self.enqueue(payload, publisher_id)?;
+                self.dequeue(client_id, Some(message_id))?;
+            }
+            None => {
+                return Err(std::io::Error::new(ErrorKind::InvalidData, "Message is not in queue"));
+            }
+        }
+        Ok(())
+    }
     pub fn list_messages(&self) -> Result<Vec<Meta>, std::io::Error> {
         let mut result = Vec::<Meta>::with_capacity(self.queue.len());
         for (key, value) in self.queue.iter() {
@@ -211,6 +235,23 @@ impl Queue {
             ))
         }
         Ok(result)
+    }
+    pub fn update_message(&mut self, message_id: u128, payload: Vec<u8>) -> Result<(), std::io::Error> {
+        if self.order.is_empty() {
+            return Err(std::io::Error::new(ErrorKind::InvalidData, "Queue is empty"));
+        }
+        if !self.queue.contains_key(&message_id) {
+            return Err(std::io::Error::new(ErrorKind::InvalidData, "Message is not in queue"));
+        }
+        match self.queue.get_mut(&message_id) {
+            Some(message) => {
+                message.payload = payload;
+            }
+            None => {
+                return Err(std::io::Error::new(ErrorKind::InvalidData, "Message is not in queue"));
+            }
+        }
+        Ok(())
     }
     fn remove_zeroes(&mut self) {
         if self.order.len() >= MAGIC_DRAIN_VEC {
@@ -225,4 +266,12 @@ impl Queue {
             }
         }
     }
+}
+fn get_meta_as_vec(message_id: u128, message: &QueueMessage) -> Vec<u8> {
+    Meta::new(
+        message_id,
+        message.publisher_id,
+        message.timestamp,
+        message.locked_by,
+    ).to_be_bytes().to_vec()
 }
