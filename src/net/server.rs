@@ -446,7 +446,7 @@ impl Server {
                                 }
                             };
                             if let Some(queue) = server.queue.read().await.get(&queue_name) {
-                                if payload_size != 16 {
+                                if payload_size < 16 {
                                     let response = ResponseMessage::new(Response::Failed, vec!());
                                     server.clone().send_response(writer, &response).await;
                                     println!("Payload doesn't contain message_id!");
@@ -517,7 +517,7 @@ impl Server {
                                 }
                             };
                             if let Some(queue) = server.queue.read().await.get(&queue_name) {
-                                if payload_size != 16 {
+                                if payload_size < 16 {
                                     let response = ResponseMessage::new(Response::Failed, vec!());
                                     server.clone().send_response(writer, &response).await;
                                     println!("Payload doesn't contain message_id!");
@@ -540,7 +540,40 @@ impl Server {
                         });
                     }
                     Request::UpdateM => {
-
+                        let server = self.clone();
+                        tokio::spawn(async move {
+                            let message = match message {
+                                Ok(message) => message,
+                                Err(err) => {
+                                    let response = ResponseMessage::new(Response::Failed, vec!());
+                                    server.send_response(writer, &response).await;
+                                    println!("[worker {:?}] parse_message error {:?}", std::thread::current().id(), err);
+                                    return;
+                                }
+                            };
+                            if payload_size < 16 {
+                                let response = ResponseMessage::new(Response::Failed, vec!());
+                                server.clone().send_response(writer, &response).await;
+                                println!("Payload doesn't contain message_id!");
+                                return;
+                            }
+                            let bytes: [u8; 16] = message.payload[..16].try_into().unwrap();
+                            let message_id = u128::from_be_bytes(bytes);
+                            let payload = message.payload[16..].to_vec();
+                            if let Some(queue) = server.queue.read().await.get(&queue_name) {
+                                match queue.lock().await.update_message(message_id, payload) {
+                                    Ok(_) => {
+                                        let response = ResponseMessage::new(Response::Succeeded, vec!());
+                                        server.clone().send_response(writer, &response).await;
+                                    }
+                                    Err(err) => {
+                                        let response = ResponseMessage::new(Response::Failed, vec!());
+                                        server.clone().send_response(writer, &response).await;
+                                        println!("[worker {:?}] update message error {:?}", std::thread::current().id(), err);
+                                    }
+                                }
+                            }
+                        });
                     }
                 }
             }

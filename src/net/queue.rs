@@ -222,7 +222,6 @@ impl Queue {
                 return Err(std::io::Error::new(ErrorKind::InvalidData, "Message is not in queue"));
             }
         }
-
         Ok(())
     }
     pub fn list_messages(&self) -> Result<Vec<Meta>, std::io::Error> {
@@ -236,6 +235,23 @@ impl Queue {
             ))
         }
         Ok(result)
+    }
+    pub fn update_message(&mut self, message_id: u128, payload: Vec<u8>) -> Result<(), std::io::Error> {
+        if self.order.is_empty() {
+            return Err(std::io::Error::new(ErrorKind::InvalidData, "Queue is empty"));
+        }
+        if !self.queue.contains_key(&message_id) {
+            return Err(std::io::Error::new(ErrorKind::InvalidData, "Message is not in queue"));
+        }
+        match self.queue.get_mut(&message_id) {
+            Some(message) => {
+                message.payload = payload;
+            }
+            None => {
+                return Err(std::io::Error::new(ErrorKind::InvalidData, "Message is not in queue"));
+            }
+        }
+        Ok(())
     }
     fn remove_zeroes(&mut self) {
         if self.order.len() >= MAGIC_DRAIN_VEC {

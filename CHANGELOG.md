@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.3.5] - 2026-04-04
+
+### Features
+- Implemented `UpdateM` command — updates a message's payload by ID (payload = 16-byte message ID + new payload)
+- Implemented `Requeue` command handler in server (queue-side `requeue` already existed)
+
+### Bug Fixes
+- Fixed `UpdateM` payload size check: was `!= 16` (rejecting any update with actual data), now `< 16`
+- Fixed `DeleteM` and `Requeue` payload size checks: moved from `!= 16` to `< 16` for consistency
+
+### Tests
+- Added `server_update_message_changes_payload` — enqueues, updates payload via `UpdateM`, then verifies the new payload on re-dequeue
+- Added `server_update_message_too_short_payload_fails` — verifies `UpdateM` with a payload shorter than 16 bytes returns Failed
+
+### Documentation
+- `CLAUDE.md` updated: `Requeue` and `UpdateM` commands documented as implemented; removed from Known Design Limitations
+
 ## [0.3.4] - 2026-04-02
 
 ### Bug Fixes

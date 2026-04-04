@@ -502,6 +502,71 @@ mod tests {
         stop_word.notify();
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn server_update_message_changes_payload() {
+        let address = free_local_addr();
+        let drained = Arc::new(Notify::new());
+        let (stop_word, _) = start_server(make_config(address), drained).unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut client = TcpStream::connect(address).await.unwrap();
+
+        client.write_all(&encode_request(3, 1, "updq", &[])).await.unwrap();
+        let response = read_response(&mut client).await;
+        assert_eq!(response[0], 1, "CreateQ: expected Succeeded");
+
+        client.write_all(&encode_request(1, 1, "updq", b"original")).await.unwrap();
+        let response = read_response(&mut client).await;
+        assert_eq!(response[0], 1, "Enqueue: expected Succeeded");
+
+        // Dequeue to get the message ID from meta
+        client.write_all(&encode_request(2, 1, "updq", &[])).await.unwrap();
+        let response = read_response(&mut client).await;
+        assert_eq!(response[0], 1, "Dequeue: expected Succeeded");
+        let message_id = &response[9..9 + 16];
+
+        // UpdateM (10) — payload is [16-byte message_id][new payload]
+        let mut update_payload = message_id.to_vec();
+        update_payload.extend_from_slice(b"updated");
+        client.write_all(&encode_request(10, 1, "updq", &update_payload)).await.unwrap();
+        let response = read_response(&mut client).await;
+        assert_eq!(response[0], 1, "UpdateM: expected Succeeded");
+
+        // Ack the locked message so we can re-dequeue
+        client.write_all(&encode_request(8, 1, "updq", &[])).await.unwrap();
+        let response = read_response(&mut client).await;
+        assert_eq!(response[0], 1, "Failed (nack/unlock): expected Succeeded");
+
+        // Dequeue again — should get updated payload
+        client.write_all(&encode_request(2, 1, "updq", &[])).await.unwrap();
+        let response = read_response(&mut client).await;
+        assert_eq!(response[0], 1, "Dequeue after update: expected Succeeded");
+        assert_eq!(&response[9 + 56..], b"updated", "payload should be updated");
+
+        stop_word.notify();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn server_update_message_too_short_payload_fails() {
+        let address = free_local_addr();
+        let drained = Arc::new(Notify::new());
+        let (stop_word, _) = start_server(make_config(address), drained).unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut client = TcpStream::connect(address).await.unwrap();
+
+        client.write_all(&encode_request(3, 1, "updq2", &[])).await.unwrap();
+        let response = read_response(&mut client).await;
+        assert_eq!(response[0], 1, "CreateQ: expected Succeeded");
+
+        // UpdateM with payload shorter than 16 bytes (no message_id)
+        client.write_all(&encode_request(10, 1, "updq2", b"short")).await.unwrap();
+        let response = read_response(&mut client).await;
+        assert_eq!(response[0], 2, "UpdateM too short: expected Failed");
+
+        stop_word.notify();
+    }
+
     #[ignore]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn server_graceful_shutdown_drains_connections() {

@@ -49,8 +49,8 @@ cargo test <test_name>
 | DeleteM | 6 | Delete a specific message by ID (payload = 16-byte message ID) |
 | Succeeded | 7 | Acknowledge processing — dequeues the message locked by this client |
 | Failed  | 8 | Nack — unlocks the message so another client can dequeue it |
-| Requeue | 9 | Not yet implemented |
-| UpdateM | 10 | Not yet implemented |
+| Requeue | 9 | Move a message to the end of the queue (payload = 16-byte message ID) |
+| UpdateM | 10 | Update a message's payload (payload = 16-byte message ID + new payload) |
 
 **Response:** `[1 byte status][8 bytes payload_size][payload]`
 - Status `1` = Succeeded, `2` = Failed
@@ -78,6 +78,5 @@ cargo test <test_name>
 ### Known Design Limitations (intentional, for learning)
 
 - `command` field in `RequestMessage` is stored but never read after construction
-- `Requeue` and `UpdateM` commands are defined but not implemented — no response is sent, leaving clients hanging
 - `locked_by` sentinel in `Meta::to_be_bytes` uses `0xFFFF` which was safe for `u16` but is now a valid `u128` client ID — should use `u128::MAX`
 - `PROC_LIMIT` is parsed but never used
