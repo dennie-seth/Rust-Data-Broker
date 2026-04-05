@@ -1,5 +1,6 @@
 use std::collections::{HashMap};
 use std::io;
+use std::io::Read;
 use std::net::{SocketAddr, SocketAddrV4};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -306,7 +307,7 @@ impl Server {
     async fn lock_and_dequeue_message(self, stream: Arc<Mutex<OwnedWriteHalf>>, queue_name: String, client_id: u128) -> Result<(), std::io::Error> {
         match self.get_queue(&queue_name).await {
             Ok(queue) => {
-                let message = queue.lock().await.lock_to_read(client_id);
+                let message = queue.lock().await.lock_to_read(client_id).await;
                 match message {
                     Ok((message, message_id)) => {
                         let message = ResponseMessage::new(Response::Succeeded, message);
@@ -339,7 +340,7 @@ impl Server {
     async fn dequeue_message_sent(self, queue_name: String, client_id: u128, message_id: Option<u128>) -> Result<(), std::io::Error> {
         match self.get_queue(&queue_name).await {
             Ok(queue) => {
-                let cleared = queue.lock().await.dequeue(client_id, message_id);
+                let cleared = queue.lock().await.dequeue(client_id, message_id).await;
                 return match cleared {
                     Ok(_) => {
                         Ok(())
@@ -382,13 +383,21 @@ impl Server {
 
         loop {
             tokio::select! {
-            _ = stop_word.notified() => { break; },
-            result = stream_read.read_buf(&mut buffer) => {
-                if result? == 0 { break; }
+                _ = stop_word.notified() => { break; },
+                result = stream_read.read_buf(&mut buffer) => {
+                    if result? == 0 { break; }
+                }
             }
-        }
             while buffer.len() >= COMMAND_SIZE + CLIENT_ID_SIZE + PAYLOAD_SIZE {
-                let command = Request::from_u8(buffer[0])?;
+                let command = Request::from_u8(buffer[0]);
+                let writer = stream_write.clone();
+                if command.is_err() {
+                    let response = ResponseMessage::new(Response::Failed, vec!());
+                    self.clone().send_response(writer, &response).await;
+                    println!("[worker {:?}] read buffer error {:?}", std::thread::current().id(), command.unwrap_err());
+                    return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Failed to read buffer"));
+                }
+                let command = command.unwrap();
                 let client_id = u128::from_be_bytes(buffer[COMMAND_SIZE..(COMMAND_SIZE+CLIENT_ID_SIZE)].try_into().unwrap());
                 let payload_size = u64::from_be_bytes(buffer[(COMMAND_SIZE+CLIENT_ID_SIZE)..(COMMAND_SIZE+CLIENT_ID_SIZE+PAYLOAD_SIZE)].try_into().unwrap());
                 if buffer.len() < payload_size as usize + (COMMAND_SIZE+CLIENT_ID_SIZE+PAYLOAD_SIZE+QUEUE_NAME_SIZE) {
@@ -402,9 +411,6 @@ impl Server {
                     println!("[worker {:?}] queue name error {:?}", std::thread::current().id(), err);
                     "".to_string()
                 });
-
-                let writer = stream_write.clone();
-
                 match command {
                     Request::Enqueue => {
                         let server = self.clone();
@@ -530,7 +536,7 @@ impl Server {
                                     }
                                     let bytes: [u8; 16] = message.payload[..16].try_into().unwrap();
                                     let message_id = u128::from_be_bytes(bytes);
-                                    match queue.lock().await.dequeue(client_id, Some(message_id)) {
+                                    match queue.lock().await.dequeue(client_id, Some(message_id)).await {
                                         Ok(_) => {
                                             let response = ResponseMessage::new(Response::Succeeded, vec!());
                                             server.clone().send_response(writer, &response).await;
@@ -555,7 +561,7 @@ impl Server {
                         tokio::spawn(async move {
                             match server.get_queue(&queue_name).await {
                                 Ok(queue) => {
-                                    match queue.lock().await.dequeue(client_id, None) {
+                                    match queue.lock().await.dequeue(client_id, None).await {
                                         Ok(_) => {
                                             let response = ResponseMessage::new(Response::Succeeded, vec!());
                                             server.clone().send_response(writer, &response).await;
@@ -580,7 +586,7 @@ impl Server {
                         tokio::spawn(async move {
                            match server.get_queue(&queue_name).await {
                                Ok(queue) => {
-                                   match queue.lock().await.unlock(client_id) {
+                                   match queue.lock().await.unlock(client_id).await {
                                        Ok(_) => {
                                            let response = ResponseMessage::new(Response::Succeeded, vec!());
                                            server.clone().send_response(writer, &response).await;
@@ -614,7 +620,7 @@ impl Server {
                                     }
                                     let bytes: [u8; 16] = message.payload[..16].try_into().unwrap();
                                     let message_id = u128::from_be_bytes(bytes);
-                                    match queue.lock().await.requeue(client_id, message_id) {
+                                    match queue.lock().await.requeue(client_id, message_id).await {
                                         Ok(_) => {
                                             let response = ResponseMessage::new(Response::Succeeded, vec!());
                                             server.clone().send_response(writer, &response).await;
@@ -693,6 +699,8 @@ impl Server {
                                             if net_queue_config.success_timeout().is_some() {
                                                 queue.lock().await.update_config_success_timeout(net_queue_config.success_timeout().unwrap());
                                             }
+                                            let response = ResponseMessage::new(Response::Succeeded, vec!());
+                                            server.clone().send_response(writer, &response).await;
                                         }
                                         Err(err) => {
                                             let response = ResponseMessage::new(Response::Failed, vec!());

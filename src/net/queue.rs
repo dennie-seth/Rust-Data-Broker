@@ -1,5 +1,7 @@
 use std::collections::{HashMap};
 use std::io::ErrorKind;
+use std::sync::Arc;
+use tokio::sync::RwLock;
 
 const MAGIC_DRAIN_VEC: usize = 10usize;
 const NET_QUEUE_CONFIG_SIZE: usize = 1usize + 1usize + 8usize;
@@ -32,7 +34,7 @@ pub(crate) struct NetQueueConfig {
 pub(crate) struct Queue {
     order: Vec<u128>,
     queue: HashMap<u128, QueueMessage>,
-    locked: HashMap<u128, u128>,
+    locked: HashMap<u128, Arc<RwLock<Vec<u128>>>>,
     next_id: Option<u128>, // next non-locked message
     config: QueueConfig,
 }
@@ -108,7 +110,7 @@ impl NetQueueConfig {
         if self.success_timeout.is_some() { flags |= 0b10; }
         bytes.push(flags);
         if let Some(auto_success) = self.auto_success { bytes.push(auto_success as u8); }
-        if let Some(success_timeout) = self.success_timeout { bytes.push(success_timeout as u8); }
+        if let Some(success_timeout) = self.success_timeout { bytes.extend_from_slice(&success_timeout.to_be_bytes()); }
         bytes
     }
     pub fn from_be_bytes(bytes: Vec<u8>) -> Result<(Self, usize), std::io::Error> {
@@ -191,7 +193,7 @@ impl Queue {
 
         Ok(())
     }
-    pub fn lock_to_read(&mut self, client_id: u128) -> Result<(Vec<u8>, Option<u128>), std::io::Error> {
+    pub async fn lock_to_read(&mut self, client_id: u128) -> Result<(Vec<u8>, Option<u128>), std::io::Error> {
         if self.order.is_empty() || self.next_id.is_none() {
             return Err(std::io::Error::new(ErrorKind::InvalidData, "Queue is empty"));
         }
@@ -206,7 +208,24 @@ impl Queue {
         let message_id = self.next_id;
         if let Some(message) = self.queue.get_mut(&self.next_id.unwrap()) {
             message.lock(client_id);
-            self.locked.insert(client_id, self.next_id.unwrap());
+            // TODO(bug): `self.locked` is keyed on client_id, so a second Dequeue by the same
+            //            client (before acking the first) overwrites the map entry. The first
+            //            message still has `locked_by = Some(client_id)` on the `QueueMessage`
+            //            itself, so next_id walks past it, but the client can no longer release
+            //            it — Succeeded(client_id)/Failed(client_id) operate on the second
+            //            lock only, and the first message becomes orphan-locked forever
+            //            (can't be re-read, can't be dequeued, can't be requeued by id without
+            //            knowing it and then only via the explicit-id DeleteM path). Either
+            //            reject lock_to_read when `self.locked.contains_key(&client_id)` or
+            //            widen `self.locked` to a `HashMap<u128, HashSet<u128>>`.
+            let message_ids = if self.locked.contains_key(&client_id) {
+                self.locked.get_mut(&client_id).unwrap().clone()
+            }
+            else {
+                Arc::new(RwLock::new(Vec::<u128>::new()))
+            };
+            message_ids.clone().write().await.push(self.next_id.unwrap());
+            self.locked.insert(client_id, message_ids);
             head = get_meta_as_vec(self.next_id.unwrap(), &message);
         }
 
@@ -233,7 +252,7 @@ impl Queue {
         }
         Ok((payload, message_id))
     }
-    pub fn dequeue(&mut self, client_id: u128, message_id: Option<u128>) -> Result<(), std::io::Error> {
+    pub async fn dequeue(&mut self, client_id: u128, message_id: Option<u128>) -> Result<(), std::io::Error> {
         if self.order.is_empty() {
             return Err(std::io::Error::new(ErrorKind::InvalidData, "Queue is empty"));
         }
@@ -259,18 +278,23 @@ impl Queue {
                 }
             }
             self.queue.remove(&message_id.unwrap());
-            if self.locked.get(&client_id) == Some(&message_id.unwrap()) {
+            if self.locked.get(&client_id).unwrap().read().await.contains(&message_id.unwrap()) {
                 self.locked.remove(&client_id);
                 self.remove_zeroes();
             }
             return Ok(());
         }
-        if let Some(id) = self.locked.clone().get(&client_id) {
-            self.queue.remove(id);
-            self.locked.remove(&client_id);
-            let mut iter = self.order.iter();
-            if let Some(id) = iter.position(|&i| i == *id) {
-                self.order[id] = 0;
+        if let Some(ids) = self.locked.clone().get(&client_id) {
+            if let Some(id) = ids.read().await.clone().into_iter().next() {
+                self.queue.remove(&id);
+                self.locked.remove(&client_id);
+                let mut iter = self.order.iter();
+                if let Some(id) = iter.position(|&i| i == id) {
+                    self.order[id] = 0;
+                }
+            }
+            else {
+                return Err(std::io::Error::new(ErrorKind::InvalidData, "No such message id locked"));
             }
         }
         else {
@@ -280,29 +304,32 @@ impl Queue {
         self.remove_zeroes();
         Ok(())
     }
-    pub fn unlock(&mut self, client_id: u128) -> Result<(), std::io::Error> {
+    pub async fn unlock(&mut self, client_id: u128) -> Result<(), std::io::Error> {
         if self.order.is_empty() {
             return Err(std::io::Error::new(ErrorKind::InvalidData, "Queue is empty"));
         }
         if !self.locked.contains_key(&client_id) {
             return Err(std::io::Error::new(ErrorKind::InvalidData, "Queue message is not locked by client {client_id}"));
         }
-        if let Some(id) = self.locked.remove(&client_id) {
-            if let Some(message) = self.queue.get_mut(&id) {
-                message.unlock();
-            }
-            if self.next_id != None {
-                if id < self.next_id.unwrap() {
-                    self.next_id = Some(id);
+        if let Some(ids) = self.locked.get_mut(&client_id) {
+            if let Some(id) = ids.read().await.first()
+            {
+                ids.write().await.remove(0);
+                if let Some(message) = self.queue.get_mut(&id) {
+                    message.unlock();
                 }
-            }
-            else {
-                self.next_id = Some(id);
+                if self.next_id != None {
+                    if id < &self.next_id.unwrap() {
+                        self.next_id = Some(*id);
+                    }
+                } else {
+                    self.next_id = Some(*id);
+                }
             }
         }
         Ok(())
     }
-    pub fn requeue(&mut self, client_id: u128, message_id: u128) -> Result<(), std::io::Error> {
+    pub async fn requeue(&mut self, client_id: u128, message_id: u128) -> Result<(), std::io::Error> {
         if self.order.is_empty() {
             return Err(std::io::Error::new(ErrorKind::InvalidData, "Queue is empty"));
         }
@@ -315,7 +342,7 @@ impl Queue {
                 let publisher_id = message.publisher_id;
 
                 self.enqueue(payload, publisher_id)?;
-                self.dequeue(client_id, Some(message_id))?;
+                self.dequeue(client_id, Some(message_id)).await?;
             }
             None => {
                 return Err(std::io::Error::new(ErrorKind::InvalidData, "Message is not in queue"));

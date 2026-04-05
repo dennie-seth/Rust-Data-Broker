@@ -35,7 +35,7 @@ pub(crate) fn parse_config(path: &str) -> Result<Config ,Box<dyn std::error::Err
                 wait_limit: data.get("WAIT_LIMIT").ok_or("missing WAIT_LIMIT") ?.parse:: < u64>()?,
                 server_addr: data.get("SERVER_ADDR").ok_or("missing SERVER_ADDR") ?.to_string(),
                 server_port: data.get("SERVER_PORT").ok_or("missing SERVER_PORT")?.to_string(),
-                queue_names: data.get("QUEUE_NAMES").ok_or_else(|| "")?.split(',').map(|s| s.to_string()).collect(),
+                queue_names: data.get("QUEUE_NAMES").ok_or_else(|| "")?.split(',').filter(|s| !s.is_empty()).map(|s| s.to_string()).collect(),
             };
             // endregion
             Ok(config)

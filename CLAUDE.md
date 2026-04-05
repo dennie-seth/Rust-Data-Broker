@@ -54,6 +54,7 @@ cargo test --release -- --ignored --nocapture
 | Failed  | 8 | Nack — unlocks the message so another client can dequeue it |
 | Requeue | 9 | Move a message to the end of the queue (payload = 16-byte message ID) |
 | UpdateM | 10 | Update a message's payload (payload = 16-byte message ID + new payload) |
+| UpdateQ | 11 | Update per-queue config (payload = `NetQueueConfig`: 1 byte flags + optional `auto_success: u8` + optional `success_timeout: u64 BE`) |
 
 **Response:** `[1 byte status][8 bytes payload_size][payload]`
 - Status `1` = Succeeded, `2` = Failed
@@ -90,3 +91,5 @@ cargo test --release -- --ignored --nocapture
 - `command` field in `RequestMessage` is stored but never read after construction
 - `PROC_LIMIT` is parsed but never used
 - On `u128` ID overflow, `enqueue` wraps the next ID back to 1, which may collide with an older message still in `self.queue` and silently overwrite it (see `TODO(note)` in `src/net/queue.rs`)
+- `read_buffer` has no upper bound on `payload_size`, so a client can request an arbitrarily large `BytesMut` allocation (DoS surface)
+- Per-queue `auto_success` auto-acks a locked message after `success_timeout` seconds unconditionally — there is no "ack-or-auto-ack-on-timeout" race, the auto-ack always fires

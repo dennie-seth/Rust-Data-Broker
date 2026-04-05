@@ -627,6 +627,76 @@ mod tests {
         stop_word.notify();
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn server_update_queue_nonexistent_responds_failure() {
+        // UpdateQ (11) against a queue that doesn't exist must return Failed.
+        // Also guards the payload-size guard (< 1 byte → Failed).
+        let address = free_local_addr();
+        let drained = Arc::new(Notify::new());
+        let (stop_word, _) = start_server(make_config(address), drained).unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut client = TcpStream::connect(address).await.unwrap();
+
+        // Send UpdateQ with a 1-byte flags payload (no flags set) on a queue that doesn't exist.
+        client.write_all(&encode_request(11, 1, "missingq", &[0u8])).await.unwrap();
+        let response = read_response(&mut client).await;
+        assert_eq!(response[0], 2, "UpdateQ on missing queue: expected Failed");
+
+        stop_word.notify();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn server_update_queue_valid_config_responds_success() {
+        // UpdateQ (11) with a valid NetQueueConfig payload must return Succeeded.
+        // Wire format: [1 byte flags][auto_success: 1 byte if flag 0x01 set][success_timeout: 8 BE bytes if flag 0x02 set]
+        let address = free_local_addr();
+        let drained = Arc::new(Notify::new());
+        let (stop_word, _) = start_server(make_config(address), drained).unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut client = TcpStream::connect(address).await.unwrap();
+
+        client.write_all(&encode_request(3, 1, "cfgok", &[])).await.unwrap();
+        let response = read_response(&mut client).await;
+        assert_eq!(response[0], 1, "CreateQ: expected Succeeded");
+
+        // flags=0b11 → both fields present; auto_success=true, success_timeout=5 (u64 BE).
+        let mut payload = Vec::new();
+        payload.push(0b11u8);
+        payload.push(1u8); // auto_success = true
+        payload.extend_from_slice(&5u64.to_be_bytes());
+
+        client.write_all(&encode_request(11, 1, "cfgok", &payload)).await.unwrap();
+        let response = read_response(&mut client).await;
+        assert_eq!(response[0], 1, "UpdateQ valid config: expected Succeeded");
+
+        stop_word.notify();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn server_update_queue_empty_payload_responds_failure() {
+        // UpdateQ (11) with payload_size < 1 must return Failed.
+        let address = free_local_addr();
+        let drained = Arc::new(Notify::new());
+        let (stop_word, _) = start_server(make_config(address), drained).unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut client = TcpStream::connect(address).await.unwrap();
+
+        // Create the queue so we're past the get_queue check.
+        client.write_all(&encode_request(3, 1, "cfgq", &[])).await.unwrap();
+        let response = read_response(&mut client).await;
+        assert_eq!(response[0], 1, "CreateQ: expected Succeeded");
+
+        // UpdateQ with an empty payload — the handler rejects payload_size < 1.
+        client.write_all(&encode_request(11, 1, "cfgq", &[])).await.unwrap();
+        let response = read_response(&mut client).await;
+        assert_eq!(response[0], 2, "UpdateQ empty payload: expected Failed");
+
+        stop_word.notify();
+    }
+
     #[ignore]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn server_graceful_shutdown_drains_connections() {
