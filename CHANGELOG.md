@@ -19,6 +19,10 @@
 
 ### Tests
 - Added `server_delete_other_message_preserves_held_lock` — regression test that locks one message, then calls `DeleteM` on a *different* message, then acks the original lock; verifies the held lock is preserved and the acked message was not collaterally deleted
+- Added `src/tests/load_tests.rs` (all `#[ignore]`; run with `cargo test --release -- --ignored --nocapture`):
+  - `pipelined_producer_does_not_stall` — one client writes 1000 enqueue requests back-to-back in a single `write_all`, then drains 1000 responses. Regression for the `read_buffer` while-loop drain fix (would have deadlocked before).
+  - `n_producers_m_consumers_each_message_delivered_once` — 4 producers × 4 consumers × 500 msgs on a shared queue. Asserts every unique payload is received exactly once (no loss, no duplicates, no spurious payloads). Catches next_id advancement, lock/ack races, and duplicate-delivery bugs.
+  - `large_payload_roundtrip_10mb` — enqueue + dequeue of a single 10 MB deterministic payload with byte-for-byte verification. Exercises `BytesMut` growth (initial capacity is only 4 KB) and the large-response write path.
 
 ### Documentation
 - `CLAUDE.md` command table: `PeekM` renamed to `ListM` to match the code (`Request::ListM = 5`)
