@@ -267,4 +267,57 @@ mod tests {
 
         stop_word.notify();
     }
+
+    // ============================================================================
+    // 100 MB payload round-trip (stress)
+    //
+    // Same shape as the 10 MB test but 10× larger. Verifies that BytesMut can
+    // grow to hold a ~100 MB request frame and that the dequeue response
+    // (56-byte meta + 100 MB payload) is written and read back intact. Expect
+    // this one to take noticeably longer and to be memory-hungry on the
+    // server side — peak RSS will be at least ~200 MB (request buffer +
+    // stored message + outbound write buffer).
+    // ============================================================================
+    #[ignore]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn large_payload_roundtrip_100mb() {
+        const SIZE: usize = 100 * 1024 * 1024; // 100 MB
+        const META_LEN: usize = 56;
+        const QNAME: &str = "hugeq";
+
+        let (address, stop_word) = start_loaded_server(2, 8).await;
+        let mut client = TcpStream::connect(address).await.unwrap();
+        create_queue(&mut client, 1, QNAME).await;
+
+        // Deterministic pattern so we can check every byte without storing a copy elsewhere.
+        let payload: Vec<u8> = (0..SIZE).map(|i| (i % 251) as u8).collect();
+
+        let start = Instant::now();
+        client.write_all(&encode_request(1, 1, QNAME, &payload)).await.unwrap();
+        let (status, _) = read_response(&mut client, Duration::from_secs(120)).await;
+        assert_eq!(status, 1, "Enqueue 100MB: expected Succeeded");
+        let enq_elapsed = start.elapsed();
+
+        let start = Instant::now();
+        client.write_all(&encode_request(2, 1, QNAME, &[])).await.unwrap();
+        let (status, response_payload) = read_response(&mut client, Duration::from_secs(120)).await;
+        let deq_elapsed = start.elapsed();
+        assert_eq!(status, 1, "Dequeue 100MB: expected Succeeded");
+        assert_eq!(response_payload.len(), META_LEN + SIZE, "dequeue response size mismatch");
+
+        let got = &response_payload[META_LEN..];
+        assert_eq!(got.len(), SIZE, "payload length mismatch");
+        // Full byte-for-byte compare — use `==` on raw slices rather than
+        // assert_eq! so a mismatch doesn't dump 100 MB into the test log.
+        assert!(got == payload.as_slice(), "100MB payload byte mismatch on round-trip");
+
+        let mbps_enq = (SIZE as f64 / (1024.0 * 1024.0)) / enq_elapsed.as_secs_f64();
+        let mbps_deq = (SIZE as f64 / (1024.0 * 1024.0)) / deq_elapsed.as_secs_f64();
+        println!(
+            "large_payload_roundtrip_100mb: enqueue {:?} ({:.1} MB/s), dequeue {:?} ({:.1} MB/s)",
+            enq_elapsed, mbps_enq, deq_elapsed, mbps_deq
+        );
+
+        stop_word.notify();
+    }
 }
