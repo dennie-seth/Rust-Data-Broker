@@ -208,16 +208,6 @@ impl Queue {
         let message_id = self.next_id;
         if let Some(message) = self.queue.get_mut(&self.next_id.unwrap()) {
             message.lock(client_id);
-            // TODO(bug): `self.locked` is keyed on client_id, so a second Dequeue by the same
-            //            client (before acking the first) overwrites the map entry. The first
-            //            message still has `locked_by = Some(client_id)` on the `QueueMessage`
-            //            itself, so next_id walks past it, but the client can no longer release
-            //            it — Succeeded(client_id)/Failed(client_id) operate on the second
-            //            lock only, and the first message becomes orphan-locked forever
-            //            (can't be re-read, can't be dequeued, can't be requeued by id without
-            //            knowing it and then only via the explicit-id DeleteM path). Either
-            //            reject lock_to_read when `self.locked.contains_key(&client_id)` or
-            //            widen `self.locked` to a `HashMap<u128, HashSet<u128>>`.
             let message_ids = if self.locked.contains_key(&client_id) {
                 self.locked.get_mut(&client_id).unwrap().clone()
             }
@@ -278,19 +268,31 @@ impl Queue {
                 }
             }
             self.queue.remove(&message_id.unwrap());
-            if self.locked.get(&client_id).unwrap().read().await.contains(&message_id.unwrap()) {
-                self.locked.remove(&client_id);
-                self.remove_zeroes();
+            if self.locked.contains_key(&client_id) {
+                if self.locked.get(&client_id).unwrap().read().await.contains(&message_id.unwrap()) {
+                    let id = self.locked.get(&client_id).unwrap().read().await.iter().position(|&x| x == message_id.unwrap());
+                    if let Some(id) = id
+                    {
+                        self.locked.get(&client_id).unwrap().write().await.remove(id);
+                        self.remove_zeroes();
+                    }
+                    else {
+                        return Err(std::io::Error::new(ErrorKind::InvalidData, "No such message id"));
+                    }
+                }
             }
             return Ok(());
         }
         if let Some(ids) = self.locked.clone().get(&client_id) {
-            if let Some(id) = ids.read().await.clone().into_iter().next() {
+            let first = { ids.read().await.first().copied() };
+            if let Some(id) = first {
                 self.queue.remove(&id);
-                self.locked.remove(&client_id);
-                let mut iter = self.order.iter();
-                if let Some(id) = iter.position(|&i| i == id) {
-                    self.order[id] = 0;
+                if self.locked.contains_key(&client_id) {
+                    self.locked.get(&client_id).unwrap().write().await.remove(0);
+                    let mut iter = self.order.iter();
+                    if let Some(id) = iter.position(|&i| i == id) {
+                        self.order[id] = 0;
+                    }
                 }
             }
             else {
@@ -312,18 +314,20 @@ impl Queue {
             return Err(std::io::Error::new(ErrorKind::InvalidData, "Queue message is not locked by client {client_id}"));
         }
         if let Some(ids) = self.locked.get_mut(&client_id) {
-            if let Some(id) = ids.read().await.first()
+            let id = ids.read().await.first().cloned();
+            if id.is_some()
             {
+                let id = id.unwrap();
                 ids.write().await.remove(0);
                 if let Some(message) = self.queue.get_mut(&id) {
                     message.unlock();
                 }
                 if self.next_id != None {
-                    if id < &self.next_id.unwrap() {
-                        self.next_id = Some(*id);
+                    if id < self.next_id.unwrap() {
+                        self.next_id = Some(id);
                     }
                 } else {
-                    self.next_id = Some(*id);
+                    self.next_id = Some(id);
                 }
             }
         }

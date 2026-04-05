@@ -1,5 +1,55 @@
 # Changelog
 
+## [0.4.3] - 2026-04-05
+
+### Features
+
+#### UpdateQ command (`src/net/server.rs`, `src/net/queue.rs`)
+- New `UpdateQ` request (command byte `11`) — updates per-queue configuration at runtime. Payload is a `NetQueueConfig` wire format: `[1 byte flags][auto_success: u8 if flag 0x01][success_timeout: u64 BE if flag 0x02]` (flags are independent, either field may be omitted).
+- Added `QueueConfig` (storage) and `NetQueueConfig` (wire) types in `queue.rs`, plus `Queue::{get_config_auto_success, get_config_success_timeout, update_config_auto_success, update_config_success_timeout}` accessors.
+- `lock_and_dequeue_message` (renamed from `send_message`) honors `auto_success`: after sending the dequeue response, it sleeps for `success_timeout` seconds and auto-acks the lock via `dequeue_message_sent`.
+
+#### Multi-lock per client (`src/net/queue.rs`)
+- `Queue.locked` widened from `HashMap<u128, u128>` to `HashMap<u128, Arc<RwLock<Vec<u128>>>>` so a single client can hold locks on multiple messages simultaneously. `lock_to_read`, `dequeue`, `unlock`, and `requeue` became `async`.
+
+### Bug Fixes
+
+#### Queue (`src/net/queue.rs`)
+- `dequeue` no longer deadlocks on the Succeeded/no-id path — an `RwLockReadGuard` temporary from `ids.read().await.clone().into_iter().next()` was living through the subsequent `.write().await` on the same `RwLock`, causing the writer to wait forever. Replaced with a scoped `ids.read().await.first().copied()` so the read guard drops before the write is taken. This was the root cause of `server_succeeded_acks_message` and `server_delete_other_message_preserves_held_lock` hanging.
+- `dequeue` by-ID path no longer panics when the caller never locked anything — the unconditional `self.locked.get(&client_id).unwrap()` was reachable because any client can dequeue any message by ID. Now guarded by `contains_key`.
+- `dequeue` by-ID path no longer drops unrelated locks when acking via explicit `message_id` — previously it called `self.locked.remove(&client_id)` which wiped the client's entire lock list. Now it finds the entry matching `message_id` in the inner `Vec` and removes only that one.
+- `dequeue` first-locked path (Succeeded/no-id) no longer drops unrelated locks — previously it called `self.locked.remove(&client_id)` after acking the first message; now it pops just index 0 from the inner `Vec`.
+- `unlock` no longer deadlocks on the multi-lock `RwLock` — prior code held a read guard from `ids.read().await.first()` across `ids.write().await.remove(0)`. Now the first id is cloned out first, read guard drops, then write is taken.
+
+#### Server (`src/net/server.rs`)
+- Unknown command byte no longer propagates `?` (which panicked upstream) — the handler now sends a `Failed` response and returns `Err(BrokenPipe)` to close the connection cleanly.
+- `read_buffer`'s `tokio::select!` block was re-indented so `stop_word.notified()` and `read_buf` are actual arms of the same select rather than sequential statements.
+- `send_message` renamed to `lock_and_dequeue_message`, `clear_message_sent` renamed to `dequeue_message_sent` to reflect what they actually do.
+- Protocol size constants (`COMMAND_SIZE`, `PAYLOAD_SIZE`, `CLIENT_ID_SIZE`, `QUEUE_NAME_SIZE`) promoted from `static` to `const`.
+
+#### Config (`src/config.rs`)
+- `QUEUE_NAMES` parsing now filters empty segments (`.filter(|s| !s.is_empty())`) so a trailing comma, leading comma, or empty `QUEUE_NAMES=` line no longer pre-creates a queue named `""`.
+
+### Tests
+
+#### New unit-level tests (`src/tests/server_tests.rs`)
+- `server_update_queue_nonexistent_responds_failure` — UpdateQ against a missing queue returns Failed.
+- `server_update_queue_valid_config_responds_success` — UpdateQ with a valid `NetQueueConfig` payload (flags=0b11, auto_success=true, success_timeout=5) returns Succeeded.
+- `server_update_queue_empty_payload_responds_failure` — UpdateQ with an empty payload returns Failed (guards `payload_size < 1`).
+- `server_drain_fires_when_accept_stops` replaces the previously `#[ignore]`d `server_graceful_shutdown_drains_connections`. The old test tried to deliver a Windows `CTRL_C_EVENT` to Tokio's signal handler after calling `SetConsoleCtrlHandler(NULL, TRUE)`, which per MSDN tells the OS to *ignore* Ctrl+C entirely — the event was suppressed before Tokio saw it, so `shutdown()` was never invoked and the test timed out at 30s. The replacement directly notifies `stop_accepting` and asserts `drained` fires within 5s, which is the actual behavior the test cared about.
+
+#### New load/stress tests (`src/tests/load_tests.rs`, all `#[ignore]`; run with `cargo test --release -- --ignored --nocapture`)
+- `pipelined_producer_does_not_stall` — one client writes 1000 enqueue requests back-to-back in a single `write_all`, then drains 1000 responses. Regression for the `read_buffer` while-loop drain fix.
+- `n_producers_m_consumers_each_message_delivered_once` — 4 producers × 4 consumers × 500 msgs on a shared queue. Asserts every unique payload is delivered exactly once (no loss, no duplicates, no spurious payloads).
+- `large_payload_roundtrip_10mb` — enqueue + dequeue of a 10 MB deterministic payload with byte-for-byte verification. Exercises `BytesMut` growth past its 4 KB initial capacity.
+- `large_payload_roundtrip_100mb` — same shape, 100 MB. Verifies `BytesMut` can hold a ~100 MB request frame and the dequeue response (56-byte meta + 100 MB payload) is written/read intact.
+
+### Documentation
+- `CLAUDE.md` command table: added `UpdateQ` row (command 11) with `NetQueueConfig` wire format.
+- `CLAUDE.md` Commands section: added `cargo test --release -- --ignored --nocapture` recipe for load tests.
+- `CLAUDE.md` Tests section: added table describing `server_tests.rs` vs `load_tests.rs` purposes.
+- `CLAUDE.md` Known Design Limitations: added unbounded `payload_size` DoS surface, added unconditional `auto_success` auto-ack (no ack-vs-timeout race).
+
 ## [0.4.2] - 2026-04-05
 
 ### Bug Fixes
