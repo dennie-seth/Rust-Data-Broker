@@ -1,7 +1,8 @@
 use std::collections::{HashMap};
 use std::io::ErrorKind;
 
-static MAGIC_DRAIN_VEC: usize = 10usize;
+const MAGIC_DRAIN_VEC: usize = 10usize;
+const NET_QUEUE_CONFIG_SIZE: usize = 1usize + 1usize + 8usize;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct QueueMessage {
@@ -11,11 +12,21 @@ pub(crate) struct QueueMessage {
     locked_by: Option<u128>,
 }
 #[derive(Debug, Clone)]
-pub(crate) struct Meta {
+pub(crate) struct MessageMeta {
     pub id: u128,
     pub publisher_id: u128,
     pub timestamp: u64,
     pub locked_by: Option<u128>,
+}
+#[derive(Debug, Clone)]
+pub(crate) struct QueueConfig {
+    auto_success: bool,
+    success_timeout: u64,
+}
+#[derive(Debug, Clone)]
+pub(crate) struct NetQueueConfig {
+    auto_success: Option<bool>,
+    success_timeout: Option<u64>,
 }
 #[derive(Debug, Clone)]
 pub(crate) struct Queue {
@@ -23,6 +34,7 @@ pub(crate) struct Queue {
     queue: HashMap<u128, QueueMessage>,
     locked: HashMap<u128, u128>,
     next_id: Option<u128>, // next non-locked message
+    config: QueueConfig,
 }
 impl QueueMessage {
     pub fn new(payload: Vec<u8>, publisher_id: u128) -> Self {
@@ -50,7 +62,7 @@ impl PartialEq<u128> for QueueMessage {
         self.locked_by.map_or(false, |id| id == *client_id)
     }
 }
-impl Meta {
+impl MessageMeta {
     pub fn new(id: u128, publisher_id: u128, timestamp: u64, locked_by: Option<u128>) -> Self {
         Self {
             id,
@@ -68,6 +80,71 @@ impl Meta {
         bytes
     }
 }
+impl QueueConfig {
+    pub fn new() -> Self {
+        Self {
+            auto_success: false,
+            success_timeout: 0,
+        }
+    }
+}
+impl NetQueueConfig {
+    pub fn new(auto_success: Option<bool>, success_timeout: Option<u64>) -> Self {
+        Self {
+            auto_success,
+            success_timeout,
+        }
+    }
+    pub fn auto_success(&self) -> Option<bool> {
+        self.auto_success
+    }
+    pub fn success_timeout(&self) -> Option<u64> {
+        self.success_timeout
+    }
+    pub fn to_be_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(NET_QUEUE_CONFIG_SIZE);
+        let mut flags = 0u8;
+        if self.auto_success.is_some() { flags |= 0b01; }
+        if self.success_timeout.is_some() { flags |= 0b10; }
+        bytes.push(flags);
+        if let Some(auto_success) = self.auto_success { bytes.push(auto_success as u8); }
+        if let Some(success_timeout) = self.success_timeout { bytes.push(success_timeout as u8); }
+        bytes
+    }
+    pub fn from_be_bytes(bytes: Vec<u8>) -> Result<(Self, usize), std::io::Error> {
+        if bytes.is_empty() {
+            return Err(std::io::Error::new(ErrorKind::InvalidData, "empty bytes"));
+        }
+        let flags = bytes[0];
+        let mut offset = 1;
+        let auto_success = if flags & 0b01 != 0 {
+            if bytes.len() < 1 + offset {
+                return Err(std::io::Error::new(ErrorKind::InvalidData, "invalid bytes auto_success"));
+            }
+            let result = bytes[offset] != 0;
+            offset += 1;
+            Some(result)
+        }
+        else {
+            None
+        };
+        let success_timeout = if flags & 0b10 != 0 {
+            if bytes.len() < 8 + offset {
+                return Err(std::io::Error::new(ErrorKind::InvalidData, "invalid bytes success_timeout"));
+            }
+            let result = u64::from_be_bytes(bytes[offset..offset + 8].try_into().unwrap());
+            offset += 8;
+            Some(result)
+        }
+        else {
+            None
+        };
+        Ok((Self {
+            auto_success,
+            success_timeout,
+        }, offset))
+    }
+}
 impl Queue {
     pub fn new() -> Self {
         Self {
@@ -75,7 +152,20 @@ impl Queue {
             queue: HashMap::new(),
             locked: HashMap::new(),
             next_id: None,
+            config: QueueConfig::new(),
         }
+    }
+    pub fn get_config_auto_success(&self) -> bool {
+        self.config.auto_success
+    }
+    pub fn get_config_success_timeout(&self) -> u64 {
+        self.config.success_timeout
+    }
+    pub fn update_config_auto_success(&mut self, value: bool) {
+        self.config.auto_success = value;
+    }
+    pub fn update_config_success_timeout(&mut self, value: u64) {
+        self.config.success_timeout = value;
     }
     pub fn enqueue(&mut self, payload: Vec<u8>, publisher_id: u128) -> Result<(), std::io::Error> {
         let mut id;
@@ -101,7 +191,7 @@ impl Queue {
 
         Ok(())
     }
-    pub fn lock_to_read(&mut self, client_id: u128) -> Result<Vec<u8>, std::io::Error> {
+    pub fn lock_to_read(&mut self, client_id: u128) -> Result<(Vec<u8>, Option<u128>), std::io::Error> {
         if self.order.is_empty() || self.next_id.is_none() {
             return Err(std::io::Error::new(ErrorKind::InvalidData, "Queue is empty"));
         }
@@ -113,6 +203,7 @@ impl Queue {
         }
 
         let mut head= vec!();
+        let message_id = self.next_id;
         if let Some(message) = self.queue.get_mut(&self.next_id.unwrap()) {
             message.lock(client_id);
             self.locked.insert(client_id, self.next_id.unwrap());
@@ -140,7 +231,7 @@ impl Queue {
             println!("End of queue");
             self.remove_zeroes();
         }
-        Ok(payload)
+        Ok((payload, message_id))
     }
     pub fn dequeue(&mut self, client_id: u128, message_id: Option<u128>) -> Result<(), std::io::Error> {
         if self.order.is_empty() {
@@ -232,10 +323,10 @@ impl Queue {
         }
         Ok(())
     }
-    pub fn list_messages(&self) -> Result<Vec<Meta>, std::io::Error> {
-        let mut result = Vec::<Meta>::with_capacity(self.queue.len());
+    pub fn list_messages(&self) -> Result<Vec<MessageMeta>, std::io::Error> {
+        let mut result = Vec::<MessageMeta>::with_capacity(self.queue.len());
         for (key, value) in self.queue.iter() {
-            result.push(Meta::new(
+            result.push(MessageMeta::new(
                 *key,
                 value.publisher_id,
                 value.timestamp,
@@ -276,7 +367,7 @@ impl Queue {
     }
 }
 fn get_meta_as_vec(message_id: u128, message: &QueueMessage) -> Vec<u8> {
-    Meta::new(
+    MessageMeta::new(
         message_id,
         message.publisher_id,
         message.timestamp,
