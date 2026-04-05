@@ -21,6 +21,9 @@ cargo test
 
 # Run a single test
 cargo test <test_name>
+
+# Load tests (ignored by default; must be run in release mode)
+cargo test --release -- --ignored --nocapture
 ```
 
 **Configuration:** Pass `--config=<path>` to specify the settings file. Without the flag, it looks for `.settings` in the current working directory.
@@ -63,6 +66,13 @@ cargo test <test_name>
 | `Server` | `src/net/server.rs` | TCP listener; accepts connections and hands to `Pool` |
 | `Pool` | `src/net/server.rs` | Worker thread pool with pressure-based dispatch |
 | `Queue` | `src/net/queue.rs` | Named message queue with lock-to-read / ack semantics |
+
+### Tests
+
+| File | Purpose |
+|------|---------|
+| `src/tests/server_tests.rs` | Unit-level integration tests — one test per command / edge case. Run by default with `cargo test`. |
+| `src/tests/load_tests.rs` | `#[ignore]`-gated concurrency and throughput tests. Run with `cargo test --release -- --ignored --nocapture`. Each test starts its own server on a free local port. |
 
 ### Config Fields
 
