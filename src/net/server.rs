@@ -201,6 +201,25 @@ impl ResponseMessage {
         bytes
     }
 }
+macro_rules! send_failed {
+        ($server: expr, $writer: expr) => {
+            {
+                let response = ResponseMessage::new(Response::Failed, vec!());
+                $server.send_response($writer, &response).await;
+                return;
+            }
+        };
+    }
+macro_rules! invalid_message_id {
+    ($server: expr, $writer: expr) => {
+        {
+            let response = ResponseMessage::new(Response::Failed, vec!());
+            $server.clone().send_response($writer, &response).await;
+            println!("Payload doesn't contain message_id!");
+            return;
+        }
+    }
+}
 impl Server {
     fn new(addr: Addr, stop_word: Arc<Notify>, stop_accepting: Arc<Notify>) -> Self {
 
@@ -308,12 +327,12 @@ impl Server {
         match self.get_queue(&queue_name).await {
             Ok(queue) => {
                 let cleared = queue.lock().await.dequeue(client_id, message_id);
-                match cleared {
+                return match cleared {
                     Ok(_) => {
-                        return Ok(())
+                        Ok(())
                         }
                     Err(err) => {
-                        return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, err.to_string()))
+                        Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, err.to_string()))
                     }
                 }
             },
@@ -328,6 +347,17 @@ impl Server {
             Ok(_) => (),
             Err(err) => {
                 println!("[worker {:?}] response error {:?}", std::thread::current().id(), err);
+            }
+        }
+    }
+    fn get_message(&self, wrapped_message: Result<RequestMessage, std::io::Error>) -> Option<RequestMessage> {
+        match wrapped_message {
+            Ok(message) => {
+                Some(message)
+            },
+            Err(err) => {
+                println!("[worker {:?}] parse_message error {:?}", std::thread::current().id(), err);
+                None
             }
         }
     }
@@ -367,15 +397,9 @@ impl Server {
                     Request::Enqueue => {
                         let server = self.clone();
                         tokio::spawn(async move {
-                            let message = match message
-                            {
-                                Ok(message) => message,
-                                Err(err) => {
-                                    let response = ResponseMessage::new(Response::Failed, vec!());
-                                    server.send_response(writer, &response).await;
-                                    println!("[worker {:?}] parse_message error {:?}", std::thread::current().id(), err);
-                                    return;
-                                }
+                            let Some(message) = server.get_message(message)
+                            else {
+                                send_failed!(server, writer)
                             };
                             match server.get_queue(&queue_name).await {
                                 Ok(queue) => {
@@ -482,23 +506,14 @@ impl Server {
                         let server = self.clone();
                         tokio::spawn(async move
                         {
-                            let message = match message
-                            {
-                                Ok(message) => message,
-                                Err(err) => {
-                                    let response = ResponseMessage::new(Response::Failed, vec!());
-                                    server.send_response(writer, &response).await;
-                                    println!("[worker {:?}] parse_message error {:?}", std::thread::current().id(), err);
-                                    return;
-                                }
+                            let Some(message) = server.get_message(message)
+                            else {
+                                send_failed!(server, writer)
                             };
                             match server.get_queue(&queue_name).await {
                                 Ok(queue) => {
                                     if payload_size < 16 {
-                                        let response = ResponseMessage::new(Response::Failed, vec!());
-                                        server.clone().send_response(writer, &response).await;
-                                        println!("Payload doesn't contain message_id!");
-                                        return;
+                                        invalid_message_id!(server, writer)
                                     }
                                     let bytes: [u8; 16] = message.payload.as_slice().try_into().unwrap();
                                     let message_id = u128::from_be_bytes(bytes);
@@ -575,22 +590,14 @@ impl Server {
                     Request::Requeue => {
                         let server = self.clone();
                         tokio::spawn(async move {
-                            let message = match message {
-                                Ok(message) => message,
-                                Err(err) => {
-                                    let response = ResponseMessage::new(Response::Failed, vec!());
-                                    server.send_response(writer, &response).await;
-                                    println!("[worker {:?}] parse_message error {:?}", std::thread::current().id(), err);
-                                    return;
-                                }
+                            let Some(message) = server.get_message(message)
+                            else {
+                                send_failed!(server, writer)
                             };
                             match server.get_queue(&queue_name).await {
                                 Ok(queue) => {
                                     if payload_size < 16 {
-                                        let response = ResponseMessage::new(Response::Failed, vec!());
-                                        server.clone().send_response(writer, &response).await;
-                                        println!("Payload doesn't contain message_id!");
-                                        return;
+                                        invalid_message_id!(server, writer)
                                     }
                                     let bytes: [u8; 16] = message.payload.as_slice().try_into().unwrap();
                                     let message_id = u128::from_be_bytes(bytes);
@@ -617,20 +624,12 @@ impl Server {
                     Request::UpdateM => {
                         let server = self.clone();
                         tokio::spawn(async move {
-                            let message = match message {
-                                Ok(message) => message,
-                                Err(err) => {
-                                    let response = ResponseMessage::new(Response::Failed, vec!());
-                                    server.send_response(writer, &response).await;
-                                    println!("[worker {:?}] parse_message error {:?}", std::thread::current().id(), err);
-                                    return;
-                                }
+                            let Some(message) = server.get_message(message)
+                            else {
+                                send_failed!(server, writer)
                             };
                             if payload_size < 16 {
-                                let response = ResponseMessage::new(Response::Failed, vec!());
-                                server.clone().send_response(writer, &response).await;
-                                println!("Payload doesn't contain message_id!");
-                                return;
+                                invalid_message_id!(server, writer)
                             }
                             let bytes: [u8; 16] = message.payload[..16].try_into().unwrap();
                             let message_id = u128::from_be_bytes(bytes);
