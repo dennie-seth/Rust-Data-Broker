@@ -84,9 +84,10 @@ impl Queue {
         }
         else {
             let (result, _) = self.order.last().unwrap().overflowing_add(1);
-            // TODO(bug): On u128 overflow, result wraps to 0. If messages with low IDs are still
+            // TODO(note): On u128 overflow, result wraps to 0. If messages with low IDs are still
             //            in the queue, this produces a duplicate ID and silently overwrites the
-            //            existing entry in self.queue. This is expected behavior for now.
+            //            existing entry in self.queue. This is expected behavior - if the message 
+            //            stays in queue for so long, it should be deleted by design.
             id = result;
             if id == 0 {
                 id = 1;
@@ -104,8 +105,8 @@ impl Queue {
         if self.order.is_empty() || self.next_id.is_none() {
             return Err(std::io::Error::new(ErrorKind::InvalidData, "Queue is empty"));
         }
-        if self.order.binary_search(&self.next_id.unwrap()).is_err() {
-            return Err(std::io::Error::new(ErrorKind::InvalidData, "Queue message does not exist"));
+        if !self.queue.contains_key(&self.next_id.unwrap()) {
+            return Err(std::io::Error::new(ErrorKind::InvalidData, "No such message id"));
         }
         if self.queue[&self.next_id.unwrap()].is_locked() {
             return Err(std::io::Error::new(ErrorKind::InvalidData, "Queue message already locked"));
@@ -126,6 +127,9 @@ impl Queue {
         match Some(iter.next()) {
             Some(id) => {
                 self.next_id = id.copied();
+                if self.next_id == Some(0) {
+                    self.next_id = self.order.iter().find(|&&x| x != 0).copied();
+                }
             },
             None => {
                 self.next_id = None;
@@ -158,14 +162,18 @@ impl Queue {
                         }
                     }
                     self.order[id] = 0; // Will clear out all the zeroes in the row later on.
+                    if self.next_id == Some(0) {
+                        self.next_id = self.order.iter().find(|&&x| x != 0).copied();
+                    }
                 }
             }
             self.queue.remove(&message_id.unwrap());
-            self.locked.remove(&client_id);
-            self.remove_zeroes();
+            if self.locked.get(&client_id) == Some(&message_id.unwrap()) {
+                self.locked.remove(&client_id);
+                self.remove_zeroes();
+            }
             return Ok(());
         }
-
         if let Some(id) = self.locked.clone().get(&client_id) {
             self.queue.remove(id);
             self.locked.remove(&client_id);

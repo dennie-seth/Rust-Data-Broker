@@ -1,5 +1,29 @@
 # Changelog
 
+## [0.4.2] - 2026-04-05
+
+### Bug Fixes
+
+#### Server (`src/net/server.rs`)
+- `read_buffer` now drains every complete message from the read buffer per wakeup (was parsing at most one per `read_buf` call, so pipelined requests could deadlock waiting for bytes that had already arrived)
+- `read_buffer` uses `break` (not `continue`) when the payload hasn't fully arrived, so control returns to the outer `read_buf` select instead of infinite-looping over the same header
+- `DeleteM` and `Requeue` no longer panic when the payload is longer than 16 bytes — switched from `as_slice().try_into()` (requires exact length) to `payload[..16].try_into()` (combined with the existing `< 16` guard)
+- `DeleteQ` now removes the name→hash entry from `queue_names` in addition to the queue itself; previously the orphan mapping persisted, causing later operations on the name to return confusing "Queue not found" errors and blocking clean reuse of the name
+
+#### Queue (`src/net/queue.rs`)
+- `lock_to_read` no longer panics when `next_id` points at a message not present in `self.queue` — added a `contains_key` guard that returns `Err("No such message id")` instead of indexing
+- Replaced the unsound `binary_search` on `self.order` (which may contain `0` holes and, after `u128` wrap, is not sorted) with a direct membership/guard check
+- `lock_to_read` and `dequeue` now advance `next_id` past `0` holes via `self.order.iter().find(|&&x| x != 0).copied()` instead of falling back to `Some(1)` (which was not guaranteed to correspond to any live message)
+- `dequeue(_, Some(message_id))` no longer clears the caller's lock on an *unrelated* message — the `self.locked.remove(&client_id)` is now guarded by `self.locked.get(&client_id) == Some(&message_id)`
+- `dequeue(_, Some(message_id))` now returns `Ok(())` on its explicit-ID path, fixing a fall-through that previously deleted a second unrelated message (the one the client held a lock on) and returned a spurious `Failed` for lock-less callers
+
+### Tests
+- Added `server_delete_other_message_preserves_held_lock` — regression test that locks one message, then calls `DeleteM` on a *different* message, then acks the original lock; verifies the held lock is preserved and the acked message was not collaterally deleted
+
+### Documentation
+- `CLAUDE.md` command table: `PeekM` renamed to `ListM` to match the code (`Request::ListM = 5`)
+- `CLAUDE.md` Known Design Limitations: removed the `locked_by` / `0xFFFF` sentinel entry (already using `u128::MAX`); added the `u128` ID-wrap collision note as a documented intentional limitation
+
 ## [0.3.5] - 2026-04-04
 
 ### Features

@@ -45,7 +45,7 @@ cargo test <test_name>
 | Dequeue | 2 | Lock and read the next message from a named queue |
 | CreateQ | 3 | Create a new named queue at runtime |
 | DeleteQ | 4 | Delete a named queue |
-| PeekM   | 5 | List message metadata for a named queue |
+| ListM   | 5 | List message metadata for a named queue |
 | DeleteM | 6 | Delete a specific message by ID (payload = 16-byte message ID) |
 | Succeeded | 7 | Acknowledge processing — dequeues the message locked by this client |
 | Failed  | 8 | Nack — unlocks the message so another client can dequeue it |
@@ -78,5 +78,5 @@ cargo test <test_name>
 ### Known Design Limitations (intentional, for learning)
 
 - `command` field in `RequestMessage` is stored but never read after construction
-- `locked_by` sentinel in `Meta::to_be_bytes` uses `0xFFFF` which was safe for `u16` but is now a valid `u128` client ID — should use `u128::MAX`
 - `PROC_LIMIT` is parsed but never used
+- On `u128` ID overflow, `enqueue` wraps the next ID back to 1, which may collide with an older message still in `self.queue` and silently overwrite it (see `TODO(note)` in `src/net/queue.rs`)
