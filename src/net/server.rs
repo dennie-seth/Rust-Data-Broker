@@ -374,13 +374,12 @@ impl Server {
                 if result? == 0 { break; }
             }
         }
-
-            if buffer.len() >= COMMAND_SIZE + CLIENT_ID_SIZE + PAYLOAD_SIZE {
+            while buffer.len() >= COMMAND_SIZE + CLIENT_ID_SIZE + PAYLOAD_SIZE {
                 let command = Request::from_u8(buffer[0])?;
                 let client_id = u128::from_be_bytes(buffer[COMMAND_SIZE..(COMMAND_SIZE+CLIENT_ID_SIZE)].try_into().unwrap());
                 let payload_size = u64::from_be_bytes(buffer[(COMMAND_SIZE+CLIENT_ID_SIZE)..(COMMAND_SIZE+CLIENT_ID_SIZE+PAYLOAD_SIZE)].try_into().unwrap());
                 if buffer.len() < payload_size as usize + (COMMAND_SIZE+CLIENT_ID_SIZE+PAYLOAD_SIZE+QUEUE_NAME_SIZE) {
-                    continue;
+                    break;
                 }
                 let queue_name = String::from_utf8(buffer[(COMMAND_SIZE+CLIENT_ID_SIZE+PAYLOAD_SIZE)..(COMMAND_SIZE+CLIENT_ID_SIZE+PAYLOAD_SIZE+QUEUE_NAME_SIZE)].try_into().unwrap())
                     .map(|s| s.trim_end_matches('\0').to_string());
@@ -460,6 +459,7 @@ impl Server {
                         let server = self.clone();
                         if self.queue_names.read().await.contains_key(&queue_name) {
                             let hash = self.queue_names.read().await.get(&queue_name).unwrap().clone();
+                            self.queue_names.write().await.remove(&queue_name);
                             self.queue.write().await.remove(&hash);
                             tokio::spawn(async move {
                                 let response = ResponseMessage::new(Response::Succeeded, vec!());
@@ -515,7 +515,7 @@ impl Server {
                                     if payload_size < 16 {
                                         invalid_message_id!(server, writer)
                                     }
-                                    let bytes: [u8; 16] = message.payload.as_slice().try_into().unwrap();
+                                    let bytes: [u8; 16] = message.payload[..16].try_into().unwrap();
                                     let message_id = u128::from_be_bytes(bytes);
                                     match queue.lock().await.dequeue(client_id, Some(message_id)) {
                                         Ok(_) => {
@@ -599,7 +599,7 @@ impl Server {
                                     if payload_size < 16 {
                                         invalid_message_id!(server, writer)
                                     }
-                                    let bytes: [u8; 16] = message.payload.as_slice().try_into().unwrap();
+                                    let bytes: [u8; 16] = message.payload[..16].try_into().unwrap();
                                     let message_id = u128::from_be_bytes(bytes);
                                     match queue.lock().await.requeue(client_id, message_id) {
                                         Ok(_) => {

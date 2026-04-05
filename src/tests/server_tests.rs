@@ -567,6 +567,66 @@ mod tests {
         stop_word.notify();
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn server_delete_other_message_preserves_held_lock() {
+        // Regression: DeleteM on a message the client does NOT hold a lock on must
+        // not drop the client's lock on a different message (previously it either
+        // dropped the unrelated lock or fell through and deleted the locked message too).
+        let address = free_local_addr();
+        let drained = Arc::new(Notify::new());
+        let (stop_word, _) = start_server(make_config(address), drained).unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut client = TcpStream::connect(address).await.unwrap();
+
+        client.write_all(&encode_request(3, 1, "mixq", &[])).await.unwrap();
+        let response = read_response(&mut client).await;
+        assert_eq!(response[0], 1, "CreateQ: expected Succeeded");
+
+        client.write_all(&encode_request(1, 1, "mixq", b"m1")).await.unwrap();
+        let response = read_response(&mut client).await;
+        assert_eq!(response[0], 1, "Enqueue m1: expected Succeeded");
+
+        // Dequeue locks m1 to client 1.
+        client.write_all(&encode_request(2, 1, "mixq", &[])).await.unwrap();
+        let response = read_response(&mut client).await;
+        assert_eq!(response[0], 1, "Dequeue: expected Succeeded");
+        let m1_id = response[9..9 + 16].to_vec();
+
+        client.write_all(&encode_request(1, 1, "mixq", b"m2")).await.unwrap();
+        let response = read_response(&mut client).await;
+        assert_eq!(response[0], 1, "Enqueue m2: expected Succeeded");
+
+        // ListM to find m2's id (the one that isn't m1).
+        client.write_all(&encode_request(5, 1, "mixq", &[])).await.unwrap();
+        let response = read_response(&mut client).await;
+        assert_eq!(response[0], 1, "ListM: expected Succeeded");
+        let payload = &response[9..];
+        assert_eq!(payload.len(), 56 * 2, "expected 2 meta entries");
+        let m2_id = if &payload[0..16] == m1_id.as_slice() {
+            payload[56..56 + 16].to_vec()
+        } else {
+            payload[0..16].to_vec()
+        };
+
+        // DeleteM on m2 while client 1 still holds the lock on m1.
+        client.write_all(&encode_request(6, 1, "mixq", &m2_id)).await.unwrap();
+        let response = read_response(&mut client).await;
+        assert_eq!(response[0], 1, "DeleteM m2: expected Succeeded");
+
+        // Client 1's lock on m1 must still be valid — Succeeded(7) should ack m1.
+        client.write_all(&encode_request(7, 1, "mixq", &[])).await.unwrap();
+        let response = read_response(&mut client).await;
+        assert_eq!(response[0], 1, "Succeeded ack of m1: expected Succeeded (lock preserved)");
+
+        // Queue is now empty — dequeue fails.
+        client.write_all(&encode_request(2, 1, "mixq", &[])).await.unwrap();
+        let response = read_response(&mut client).await;
+        assert_eq!(response[0], 2, "Dequeue after empty: expected Failed");
+
+        stop_word.notify();
+    }
+
     #[ignore]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn server_graceful_shutdown_drains_connections() {
