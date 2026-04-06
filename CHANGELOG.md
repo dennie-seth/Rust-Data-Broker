@@ -1,5 +1,45 @@
 # Changelog
 
+## [0.5.0] - 2026-04-06
+
+### Breaking Changes
+
+#### Renamed `auto_success` → `auto_fail` (`src/net/queue.rs`, `src/net/server.rs`)
+- `QueueConfig` fields renamed: `auto_success` → `auto_fail`, `success_timeout` → `fail_timeout`.
+- `NetQueueConfig` accessors renamed: `auto_success()` → `auto_fail()`, `success_timeout()` → `fail_timeout()`.
+- `Queue` accessors renamed: `get_config_auto_success` → `get_config_auto_fail`, `get_config_success_timeout` → `get_config_fail_timeout`, `update_config_auto_success` → `update_config_auto_fail`, `update_config_success_timeout` → `update_config_fail_timeout`.
+- Wire format is unchanged — only Rust-side names were updated. The rename reflects the actual behavior: the feature NACKs (unlocks) messages after a timeout, it does not ACK them.
+
+#### `Queue::unlock` signature changed (`src/net/queue.rs`)
+- `unlock(&mut self, client_id: u128)` → `unlock(&mut self, client_id: u128, message_id: Option<u128>)`. When `message_id` is `Some`, unlock targets that specific message in the client's lock vec; when `None`, it pops the first lock (preserving the old behavior for `Request::Failed`).
+
+### Features
+
+#### `Queue::is_locked` (`src/net/queue.rs`)
+- New `is_locked(&self, client_id: u128, message_id: u128) -> bool` method — checks whether a specific message is currently locked by a given client. Used by the auto-fail guard in `lock_and_dequeue_message`.
+
+### Bug Fixes
+
+#### Auto-fail rewrite (`src/net/server.rs`)
+- `lock_and_dequeue_message` no longer calls `dequeue_message_sent` (ACK) after the timeout — it now calls `Queue::unlock` (NACK), matching the intended "visibility timeout" semantics: if the client doesn't ack in time, the message goes back on the queue for redelivery.
+- Changed sleep unit from `Duration::from_secs` to `Duration::from_millis` for finer-grained control.
+- Added early return when `fail_timeout == 0` (auto-fail enabled but no timeout → skip the sleep entirely).
+- Added `is_locked` guard before `unlock`, held under the same `queue.lock().await` acquisition, preventing both a panic (`.position(...).unwrap()` on a missing entry) and stale NACKs when the client races in a Succeeded ack during the sleep.
+
+#### `Queue::unlock` targeted unlock (`src/net/queue.rs`)
+- When `message_id` is `Some` and present in the client's lock vec, `unlock` now finds and removes that specific entry by position instead of always popping index 0. This prevents auto-fail from unlocking the wrong message when a client holds multiple locks.
+- When `message_id` is `Some` but not in the lock vec (e.g. already acked), the fallback to `first()` prevents a panic in the position lookup.
+
+#### `Request::Succeeded` handler (`src/net/server.rs`)
+- Refactored to call `dequeue_message_sent` (the existing helper) instead of inlining the `get_queue` + `dequeue` calls. No behavioral change — deduplicates the ACK path.
+
+#### `Request::Failed` handler (`src/net/server.rs`)
+- Updated to pass `None` as `message_id` to the new `unlock` signature, preserving "unlock first lock" semantics.
+
+### Documentation
+- `CLAUDE.md` command table: `auto_success` → `auto_fail`, `success_timeout` → `fail_timeout` in UpdateQ wire format.
+- `CLAUDE.md` Known Design Limitations: rewrote `auto_fail` entry — documents the NACK-on-timeout behavior, millisecond units, and the `is_locked` guard that prevents the ack-race panic.
+
 ## [0.4.3] - 2026-04-05
 
 ### Features

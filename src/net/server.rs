@@ -312,15 +312,23 @@ impl Server {
                     Ok((message, message_id)) => {
                         let message = ResponseMessage::new(Response::Succeeded, message);
                         stream.lock().await.write_all(&message.to_u8()).await?;
-                        if queue.lock().await.get_config_auto_success() {
-                            let duration = queue.lock().await.get_config_success_timeout();
-                            tokio::time::sleep(Duration::from_secs(duration)).await;
-                            match self.dequeue_message_sent(queue_name, client_id, message_id).await {
-                                Ok(_) => {
-                                    println!("[worker {:?}] auto clear_message_sent", std::thread::current().id());
-                                },
-                                Err(err) => {
-                                    println!("[worker {:?}] auto clear_message_sent error {:?}", std::thread::current().id(), err);
+                        if queue.lock().await.get_config_auto_fail() {
+                            let duration = queue.lock().await.get_config_fail_timeout();
+                            if duration == 0u64 {
+                                return Ok(())
+                            }
+                            tokio::time::sleep(Duration::from_millis(duration)).await;
+                            {
+                                let mut lock= queue.lock().await;
+                                if lock.is_locked(client_id, message_id.unwrap()).await {
+                                    match lock.unlock(client_id, message_id).await {
+                                        Ok(_) => {
+                                            println!("[worker {:?}] auto unlock message", std::thread::current().id());
+                                        },
+                                        Err(err) => {
+                                            println!("[worker {:?}] auto unlock message error {:?}", std::thread::current().id(), err);
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -559,24 +567,15 @@ impl Server {
                     Request::Succeeded => {
                         let server = self.clone();
                         tokio::spawn(async move {
-                            match server.get_queue(&queue_name).await {
-                                Ok(queue) => {
-                                    match queue.lock().await.dequeue(client_id, None).await {
-                                        Ok(_) => {
-                                            let response = ResponseMessage::new(Response::Succeeded, vec!());
-                                            server.clone().send_response(writer, &response).await;
-                                        }
-                                        Err(err) => {
-                                            let response = ResponseMessage::new(Response::Failed, vec!());
-                                            server.clone().send_response(writer, &response).await;
-                                            println!("[worker {:?}] dequeue message error {:?}", std::thread::current().id(), err);
-                                        }
-                                    }
-                                },
+                            match server.clone().dequeue_message_sent(queue_name, client_id, None).await {
+                                Ok(_) => {
+                                    let response = ResponseMessage::new(Response::Succeeded, vec!());
+                                    server.clone().send_response(writer, &response).await;
+                                }
                                 Err(err) => {
                                     let response = ResponseMessage::new(Response::Failed, vec!());
                                     server.clone().send_response(writer, &response).await;
-                                    println!("[worker {:?}] dequeue message error {}", std::thread::current().id(), err);
+                                    println!("[worker {:?}] dequeue message error {:?}", std::thread::current().id(), err);
                                 }
                             }
                         });
@@ -586,7 +585,7 @@ impl Server {
                         tokio::spawn(async move {
                            match server.get_queue(&queue_name).await {
                                Ok(queue) => {
-                                   match queue.lock().await.unlock(client_id).await {
+                                   match queue.lock().await.unlock(client_id, None).await {
                                        Ok(_) => {
                                            let response = ResponseMessage::new(Response::Succeeded, vec!());
                                            server.clone().send_response(writer, &response).await;
@@ -693,11 +692,11 @@ impl Server {
                                     let payload = message.payload.to_vec();
                                     match NetQueueConfig::from_be_bytes(payload) {
                                         Ok((net_queue_config, _)) => {
-                                            if net_queue_config.auto_success().is_some() {
-                                                queue.lock().await.update_config_auto_success(net_queue_config.auto_success().unwrap());
+                                            if net_queue_config.auto_fail().is_some() {
+                                                queue.lock().await.update_config_auto_fail(net_queue_config.auto_fail().unwrap());
                                             }
-                                            if net_queue_config.success_timeout().is_some() {
-                                                queue.lock().await.update_config_success_timeout(net_queue_config.success_timeout().unwrap());
+                                            if net_queue_config.fail_timeout().is_some() {
+                                                queue.lock().await.update_config_fail_timeout(net_queue_config.fail_timeout().unwrap());
                                             }
                                             let response = ResponseMessage::new(Response::Succeeded, vec!());
                                             server.clone().send_response(writer, &response).await;
