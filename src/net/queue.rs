@@ -22,13 +22,13 @@ pub(crate) struct MessageMeta {
 }
 #[derive(Debug, Clone)]
 pub(crate) struct QueueConfig {
-    auto_success: bool,
-    success_timeout: u64,
+    auto_fail: bool,
+    fail_timeout: u64,
 }
 #[derive(Debug, Clone)]
 pub(crate) struct NetQueueConfig {
-    auto_success: Option<bool>,
-    success_timeout: Option<u64>,
+    auto_fail: Option<bool>,
+    fail_timeout: Option<u64>,
 }
 #[derive(Debug, Clone)]
 pub(crate) struct Queue {
@@ -85,32 +85,32 @@ impl MessageMeta {
 impl QueueConfig {
     pub fn new() -> Self {
         Self {
-            auto_success: false,
-            success_timeout: 0,
+            auto_fail: false,
+            fail_timeout: 0,
         }
     }
 }
 impl NetQueueConfig {
     pub fn new(auto_success: Option<bool>, success_timeout: Option<u64>) -> Self {
         Self {
-            auto_success,
-            success_timeout,
+            auto_fail: auto_success,
+            fail_timeout: success_timeout,
         }
     }
-    pub fn auto_success(&self) -> Option<bool> {
-        self.auto_success
+    pub fn auto_fail(&self) -> Option<bool> {
+        self.auto_fail
     }
-    pub fn success_timeout(&self) -> Option<u64> {
-        self.success_timeout
+    pub fn fail_timeout(&self) -> Option<u64> {
+        self.fail_timeout
     }
     pub fn to_be_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(NET_QUEUE_CONFIG_SIZE);
         let mut flags = 0u8;
-        if self.auto_success.is_some() { flags |= 0b01; }
-        if self.success_timeout.is_some() { flags |= 0b10; }
+        if self.auto_fail.is_some() { flags |= 0b01; }
+        if self.fail_timeout.is_some() { flags |= 0b10; }
         bytes.push(flags);
-        if let Some(auto_success) = self.auto_success { bytes.push(auto_success as u8); }
-        if let Some(success_timeout) = self.success_timeout { bytes.extend_from_slice(&success_timeout.to_be_bytes()); }
+        if let Some(auto_success) = self.auto_fail { bytes.push(auto_success as u8); }
+        if let Some(success_timeout) = self.fail_timeout { bytes.extend_from_slice(&success_timeout.to_be_bytes()); }
         bytes
     }
     pub fn from_be_bytes(bytes: Vec<u8>) -> Result<(Self, usize), std::io::Error> {
@@ -142,8 +142,8 @@ impl NetQueueConfig {
             None
         };
         Ok((Self {
-            auto_success,
-            success_timeout,
+            auto_fail: auto_success,
+            fail_timeout: success_timeout,
         }, offset))
     }
 }
@@ -157,17 +157,17 @@ impl Queue {
             config: QueueConfig::new(),
         }
     }
-    pub fn get_config_auto_success(&self) -> bool {
-        self.config.auto_success
+    pub fn get_config_auto_fail(&self) -> bool {
+        self.config.auto_fail
     }
-    pub fn get_config_success_timeout(&self) -> u64 {
-        self.config.success_timeout
+    pub fn get_config_fail_timeout(&self) -> u64 {
+        self.config.fail_timeout
     }
-    pub fn update_config_auto_success(&mut self, value: bool) {
-        self.config.auto_success = value;
+    pub fn update_config_auto_fail(&mut self, value: bool) {
+        self.config.auto_fail = value;
     }
-    pub fn update_config_success_timeout(&mut self, value: u64) {
-        self.config.success_timeout = value;
+    pub fn update_config_fail_timeout(&mut self, value: u64) {
+        self.config.fail_timeout = value;
     }
     pub fn enqueue(&mut self, payload: Vec<u8>, publisher_id: u128) -> Result<(), std::io::Error> {
         let mut id;
@@ -306,28 +306,60 @@ impl Queue {
         self.remove_zeroes();
         Ok(())
     }
-    pub async fn unlock(&mut self, client_id: u128) -> Result<(), std::io::Error> {
+    pub async fn is_locked(&self, client_id: u128, message_id: u128) -> bool {
+        if self.order.is_empty() {
+            println!("Queue is empty");
+        }
+        if !self.locked.contains_key(&client_id) {
+            println!("Queue message is not locked by client {client_id}");
+        }
+        if let Some(message_ids) = self.locked.get(&client_id) {
+            if message_ids.read().await.contains(&message_id) {
+                return true
+            }
+        }
+        println!("Queue message is not locked by client {client_id}");
+        false
+    }
+    pub async fn unlock(&mut self, client_id: u128, message_id: Option<u128>) -> Result<(), std::io::Error> {
         if self.order.is_empty() {
             return Err(std::io::Error::new(ErrorKind::InvalidData, "Queue is empty"));
         }
         if !self.locked.contains_key(&client_id) {
             return Err(std::io::Error::new(ErrorKind::InvalidData, "Queue message is not locked by client {client_id}"));
         }
-        if let Some(ids) = self.locked.get_mut(&client_id) {
-            let id = ids.read().await.first().cloned();
-            if id.is_some()
+        if let Some(message_ids) = self.locked.get_mut(&client_id) {
+            let found_message_id = if message_id.is_some() {
+                if message_ids.read().await.contains(&message_id.unwrap()) {
+                    message_id
+                }
+                else {
+                    message_ids.read().await.first().cloned()
+                }
+            }
+            else {
+                message_ids.read().await.first().cloned()
+            };
+            
+            if found_message_id.is_some()
             {
-                let id = id.unwrap();
-                ids.write().await.remove(0);
-                if let Some(message) = self.queue.get_mut(&id) {
+                let id_to_delete = found_message_id.unwrap();
+                let id = if found_message_id.is_some() {
+                    message_ids.read().await.iter().position(|&x| x == found_message_id.unwrap()).unwrap()
+                }
+                else {
+                    0
+                };
+                message_ids.write().await.remove(id);
+                if let Some(message) = self.queue.get_mut(&id_to_delete) {
                     message.unlock();
                 }
                 if self.next_id != None {
-                    if id < self.next_id.unwrap() {
-                        self.next_id = Some(id);
+                    if id_to_delete < self.next_id.unwrap() {
+                        self.next_id = Some(id_to_delete);
                     }
                 } else {
-                    self.next_id = Some(id);
+                    self.next_id = Some(id_to_delete);
                 }
             }
         }
