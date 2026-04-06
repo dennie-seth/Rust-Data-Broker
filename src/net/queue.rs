@@ -334,7 +334,7 @@ impl Queue {
                     message_id
                 }
                 else {
-                    message_ids.read().await.first().cloned()
+                    return Err(std::io::Error::new(ErrorKind::InvalidData, "Queue message is not locked by client {client_id}"));
                 }
             }
             else {
