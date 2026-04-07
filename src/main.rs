@@ -1,6 +1,7 @@
 mod net;
 mod config;
 mod tests;
+mod errors;
 
 use std::collections::HashMap;
 use std::sync::Arc;

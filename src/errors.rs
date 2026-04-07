@@ -13,6 +13,10 @@ pub enum ErrorCode {
     UnknownRequestType          = 0,
     /// `RequestMessage::new()` failed to parse the incoming buffer.
     RequestParseError           = 1,
+    /// Failed to send response.
+    ResponseFailedError         = 2,
+    /// Declared payload_size exceeds MAX_PAYLOAD_SIZE.
+    PayloadTooLarge             = 3,
 
     // ── 100–199: Queue-level errors ───────────────────────────────────
     /// Queue name does not map to any UUID (get_queue → "Hash not found").
@@ -56,10 +60,16 @@ impl ErrorCode {
         self as u16
     }
 
+    pub fn to_payload(self) -> Vec<u8> {
+        self.as_u16().to_be_bytes().to_vec()
+    }
+
     pub fn from_u16(value: u16) -> Option<Self> {
         match value {
             0   => Some(Self::UnknownRequestType),
             1   => Some(Self::RequestParseError),
+            2   => Some(Self::ResponseFailedError),
+            3   => Some(Self::PayloadTooLarge),
             100 => Some(Self::QueueHashNotFound),
             101 => Some(Self::QueueNotFound),
             102 => Some(Self::QueueAlreadyExists),
@@ -85,6 +95,8 @@ impl std::fmt::Display for ErrorCode {
         match self {
             Self::UnknownRequestType        => write!(f, "Unknown request type"),
             Self::RequestParseError         => write!(f, "Failed to parse request message"),
+            Self::ResponseFailedError        => write!(f, "Failed to send response"),
+            Self::PayloadTooLarge           => write!(f, "Payload exceeds maximum size"),
             Self::QueueHashNotFound         => write!(f, "Hash not found"),
             Self::QueueNotFound             => write!(f, "Queue not found"),
             Self::QueueAlreadyExists        => write!(f, "Queue already created"),

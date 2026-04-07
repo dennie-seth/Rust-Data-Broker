@@ -62,6 +62,7 @@ cargo test --release -- --ignored --nocapture
 
 **Response:** `[1 byte status][8 bytes payload_size][payload]`
 - Status `1` = Succeeded, `2` = Failed
+- Failed responses carry a 2-byte `ErrorCode` payload (big-endian `u16`). Error codes are defined in `src/errors.rs` and grouped by category: 0–99 general/protocol, 100–199 queue-level, 200–299 message-level, 300–399 config/parsing.
 
 ### Key Types
 
@@ -71,6 +72,7 @@ cargo test --release -- --ignored --nocapture
 | `Server` | `src/net/server.rs` | TCP listener; accepts connections and hands to `Pool` |
 | `Pool` | `src/net/server.rs` | Worker thread pool with pressure-based dispatch |
 | `Queue` | `src/net/queue.rs` | Named message queue with lock-to-read / ack semantics |
+| `ErrorCode` | `src/errors.rs` | `#[repr(u16)]` enum of typed error codes returned in Failed response payloads |
 
 ### Tests
 
@@ -96,4 +98,6 @@ cargo test --release -- --ignored --nocapture
 - `PROC_LIMIT` is parsed but never used
 - On `u128` ID overflow, `enqueue` wraps the next ID back to 1, which may collide with an older message still in `self.queue` and silently overwrite it (see `TODO(note)` in `src/net/queue.rs`)
 - `read_buffer` has a `MAX_PAYLOAD_SIZE` guard (4 GB) that rejects oversized payloads before buffering
+- `get_queue` returns a cloned `Arc<Mutex<Queue>>`. After it returns, a concurrent `DeleteQ` can remove the queue from both maps. All handlers using `get_queue` then operate on an orphaned queue — writes succeed silently but data is lost (see `TODO(bug)` in `src/net/server.rs`)
+- UpdateQ handler updates `auto_fail` and `fail_timeout` under separate Mutex acquisitions, so a concurrent Dequeue between them can read a half-updated config (see `TODO(bug)` in `src/net/server.rs`)
 - Per-queue `auto_fail`: when enabled, after a Dequeue the server sleeps for `fail_timeout` **milliseconds** and then NACKs the just-sent message via `Queue::unlock`, putting it back on the queue for redelivery. An `is_locked` guard (held under the same Mutex acquisition as `unlock`) prevents both panic and stale NACK if the client acks first.
