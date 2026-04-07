@@ -718,4 +718,156 @@ mod tests {
             .await.expect("server did not drain within 5 seconds")
             .unwrap();
     }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn server_enqueue_nonexistent_queue_responds_failure() {
+        let address = free_local_addr();
+        let drained = Arc::new(Notify::new());
+        let (stop_word, _) = start_server(make_config(address), drained).unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut client = TcpStream::connect(address).await.unwrap();
+
+        client.write_all(&encode_request(1, 1, "noqueue", b"data")).await.unwrap();
+        let response = read_response(&mut client).await;
+        assert_eq!(response[0], 2, "Enqueue to nonexistent queue: expected Failed");
+
+        stop_word.notify();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn server_delete_message_short_payload_responds_failure() {
+        let address = free_local_addr();
+        let drained = Arc::new(Notify::new());
+        let (stop_word, _) = start_server(make_config(address), drained).unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut client = TcpStream::connect(address).await.unwrap();
+
+        client.write_all(&encode_request(3, 1, "delmq2", &[])).await.unwrap();
+        let response = read_response(&mut client).await;
+        assert_eq!(response[0], 1, "CreateQ: expected Succeeded");
+
+        // DeleteM with payload shorter than 16 bytes (no valid message_id)
+        client.write_all(&encode_request(6, 1, "delmq2", b"short")).await.unwrap();
+        let response = read_response(&mut client).await;
+        assert_eq!(response[0], 2, "DeleteM short payload: expected Failed");
+
+        stop_word.notify();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn server_list_messages_nonexistent_queue_responds_failure() {
+        let address = free_local_addr();
+        let drained = Arc::new(Notify::new());
+        let (stop_word, _) = start_server(make_config(address), drained).unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut client = TcpStream::connect(address).await.unwrap();
+
+        client.write_all(&encode_request(5, 1, "noqueue", &[])).await.unwrap();
+        let response = read_response(&mut client).await;
+        assert_eq!(response[0], 2, "ListM on nonexistent queue: expected Failed");
+
+        stop_word.notify();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn server_failed_response_carries_error_code_payload() {
+        // Verify that Failed responses contain a 2-byte ErrorCode payload (big-endian u16).
+        use crate::errors::ErrorCode;
+
+        let address = free_local_addr();
+        let drained = Arc::new(Notify::new());
+        let (stop_word, _) = start_server(make_config(address), drained).unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut client = TcpStream::connect(address).await.unwrap();
+
+        // Enqueue to nonexistent queue → QueueHashNotFound (100)
+        client.write_all(&encode_request(1, 1, "noqueue", b"data")).await.unwrap();
+        let response = read_response(&mut client).await;
+        assert_eq!(response[0], 2, "expected Failed");
+        let error_payload = &response[9..];
+        assert_eq!(error_payload.len(), 2, "Failed payload should be 2 bytes (error code)");
+        let code = u16::from_be_bytes(error_payload.try_into().unwrap());
+        assert_eq!(
+            ErrorCode::from_u16(code),
+            Some(ErrorCode::QueueHashNotFound),
+            "expected QueueHashNotFound error code"
+        );
+
+        stop_word.notify();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn server_dequeue_nonexistent_queue_responds_failure() {
+        use crate::errors::ErrorCode;
+
+        let address = free_local_addr();
+        let drained = Arc::new(Notify::new());
+        let (stop_word, _) = start_server(make_config(address), drained).unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut client = TcpStream::connect(address).await.unwrap();
+
+        // Dequeue from a queue that was never created
+        client.write_all(&encode_request(2, 1, "noqueue", &[])).await.unwrap();
+        let response = read_response(&mut client).await;
+        assert_eq!(response[0], 2, "Dequeue nonexistent queue: expected Failed");
+        let code = u16::from_be_bytes(response[9..11].try_into().unwrap());
+        assert_eq!(
+            ErrorCode::from_u16(code),
+            Some(ErrorCode::QueueHashNotFound),
+            "expected QueueHashNotFound error code"
+        );
+
+        stop_word.notify();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn server_succeeded_without_lock_responds_failure() {
+        let address = free_local_addr();
+        let drained = Arc::new(Notify::new());
+        let (stop_word, _) = start_server(make_config(address), drained).unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut client = TcpStream::connect(address).await.unwrap();
+
+        client.write_all(&encode_request(3, 1, "ackq2", &[])).await.unwrap();
+        let response = read_response(&mut client).await;
+        assert_eq!(response[0], 1, "CreateQ: expected Succeeded");
+
+        client.write_all(&encode_request(1, 1, "ackq2", b"data")).await.unwrap();
+        let response = read_response(&mut client).await;
+        assert_eq!(response[0], 1, "Enqueue: expected Succeeded");
+
+        // Succeeded (7) without dequeuing first — no locked message for this client
+        client.write_all(&encode_request(7, 1, "ackq2", &[])).await.unwrap();
+        let response = read_response(&mut client).await;
+        assert_eq!(response[0], 2, "Succeeded without lock: expected Failed");
+
+        stop_word.notify();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn server_requeue_short_payload_responds_failure() {
+        let address = free_local_addr();
+        let drained = Arc::new(Notify::new());
+        let (stop_word, _) = start_server(make_config(address), drained).unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut client = TcpStream::connect(address).await.unwrap();
+
+        client.write_all(&encode_request(3, 1, "reqq2", &[])).await.unwrap();
+        let response = read_response(&mut client).await;
+        assert_eq!(response[0], 1, "CreateQ: expected Succeeded");
+
+        // Requeue (9) with payload shorter than 16 bytes (no valid message_id)
+        client.write_all(&encode_request(9, 1, "reqq2", b"short")).await.unwrap();
+        let response = read_response(&mut client).await;
+        assert_eq!(response[0], 2, "Requeue short payload: expected Failed");
+
+        stop_word.notify();
+    }
 }
