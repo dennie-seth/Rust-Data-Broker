@@ -1,14 +1,16 @@
 use std::collections::{HashMap};
 use std::io::ErrorKind;
 use std::sync::Arc;
+use bytes::BytesMut;
 use tokio::sync::RwLock;
+use uuid::Bytes;
 
 const MAGIC_DRAIN_VEC: usize = 10usize;
 const NET_QUEUE_CONFIG_SIZE: usize = 1usize + 1usize + 8usize;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct QueueMessage {
-    payload: Vec<u8>,
+    payload: BytesMut,
     publisher_id: u128,
     timestamp: u64,
     locked_by: Option<u128>,
@@ -39,7 +41,7 @@ pub(crate) struct Queue {
     config: QueueConfig,
 }
 impl QueueMessage {
-    pub fn new(payload: Vec<u8>, publisher_id: u128) -> Self {
+    pub fn new(payload: BytesMut, publisher_id: u128) -> Self {
         Self {
             payload,
             publisher_id,
@@ -169,7 +171,7 @@ impl Queue {
     pub fn update_config_fail_timeout(&mut self, value: u64) {
         self.config.fail_timeout = value;
     }
-    pub fn enqueue(&mut self, payload: Vec<u8>, publisher_id: u128) -> Result<(), std::io::Error> {
+    pub fn enqueue(&mut self, payload: BytesMut, publisher_id: u128) -> Result<(), std::io::Error> {
         let mut id;
         if self.order.is_empty() {
             id = 1;
@@ -219,7 +221,7 @@ impl Queue {
             head = get_meta_as_vec(self.next_id.unwrap(), &message);
         }
 
-        head.append(&mut self.queue[&self.next_id.unwrap()].payload.clone());
+        head.append(&mut self.queue[&self.next_id.unwrap()].payload.to_vec());
         let payload: Vec<u8> = head;
 
         let mut iter = self.order.iter();
@@ -398,7 +400,7 @@ impl Queue {
         }
         Ok(result)
     }
-    pub fn update_message(&mut self, message_id: u128, payload: Vec<u8>) -> Result<(), std::io::Error> {
+    pub fn update_message(&mut self, message_id: u128, payload: BytesMut) -> Result<(), std::io::Error> {
         if self.order.is_empty() {
             return Err(std::io::Error::new(ErrorKind::InvalidData, "Queue is empty"));
         }

@@ -320,4 +320,55 @@ mod tests {
 
         stop_word.notify();
     }
+
+    // ============================================================================
+    // 1 GB payload round-trip (stress)
+    //
+    // Same shape as the 100 MB test but 10× larger. Verifies that the server
+    // can handle a single ~1 GB request frame end-to-end: allocation, storage,
+    // and faithful dequeue. Peak RSS will be at least ~2 GB (request buffer +
+    // stored message + outbound write buffer). Timeouts are generous to
+    // accommodate slower CI machines.
+    // ============================================================================
+    #[ignore]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn large_payload_roundtrip_1gb() {
+        const SIZE: usize = 1024 * 1024 * 1024; // 1 GB
+        const META_LEN: usize = 56;
+        const QNAME: &str = "gbq";
+
+        let (address, stop_word) = start_loaded_server(2, 8).await;
+        let mut client = TcpStream::connect(address).await.unwrap();
+        create_queue(&mut client, 1, QNAME).await;
+
+        // Deterministic pattern so we can check every byte without storing a copy elsewhere.
+        let payload: Vec<u8> = (0..SIZE).map(|i| (i % 251) as u8).collect();
+
+        let start = Instant::now();
+        client.write_all(&encode_request(1, 1, QNAME, &payload)).await.unwrap();
+        let (status, _) = read_response(&mut client, Duration::from_secs(300)).await;
+        assert_eq!(status, 1, "Enqueue 1GB: expected Succeeded");
+        let enq_elapsed = start.elapsed();
+
+        let start = Instant::now();
+        client.write_all(&encode_request(2, 1, QNAME, &[])).await.unwrap();
+        let (status, response_payload) = read_response(&mut client, Duration::from_secs(300)).await;
+        let deq_elapsed = start.elapsed();
+        assert_eq!(status, 1, "Dequeue 1GB: expected Succeeded");
+        assert_eq!(response_payload.len(), META_LEN + SIZE, "dequeue response size mismatch");
+
+        let got = &response_payload[META_LEN..];
+        assert_eq!(got.len(), SIZE, "payload length mismatch");
+        // Use `==` on raw slices — assert_eq! would dump 1 GB into the test log on failure.
+        assert!(got == payload.as_slice(), "1GB payload byte mismatch on round-trip");
+
+        let mbps_enq = (SIZE as f64 / (1024.0 * 1024.0)) / enq_elapsed.as_secs_f64();
+        let mbps_deq = (SIZE as f64 / (1024.0 * 1024.0)) / deq_elapsed.as_secs_f64();
+        println!(
+            "large_payload_roundtrip_1gb: enqueue {:?} ({:.1} MB/s), dequeue {:?} ({:.1} MB/s)",
+            enq_elapsed, mbps_enq, deq_elapsed, mbps_deq
+        );
+
+        stop_word.notify();
+    }
 }

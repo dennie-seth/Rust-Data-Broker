@@ -718,4 +718,57 @@ mod tests {
             .await.expect("server did not drain within 5 seconds")
             .unwrap();
     }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn server_enqueue_nonexistent_queue_responds_failure() {
+        let address = free_local_addr();
+        let drained = Arc::new(Notify::new());
+        let (stop_word, _) = start_server(make_config(address), drained).unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut client = TcpStream::connect(address).await.unwrap();
+
+        client.write_all(&encode_request(1, 1, "noqueue", b"data")).await.unwrap();
+        let response = read_response(&mut client).await;
+        assert_eq!(response[0], 2, "Enqueue to nonexistent queue: expected Failed");
+
+        stop_word.notify();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn server_delete_message_short_payload_responds_failure() {
+        let address = free_local_addr();
+        let drained = Arc::new(Notify::new());
+        let (stop_word, _) = start_server(make_config(address), drained).unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut client = TcpStream::connect(address).await.unwrap();
+
+        client.write_all(&encode_request(3, 1, "delmq2", &[])).await.unwrap();
+        let response = read_response(&mut client).await;
+        assert_eq!(response[0], 1, "CreateQ: expected Succeeded");
+
+        // DeleteM with payload shorter than 16 bytes (no valid message_id)
+        client.write_all(&encode_request(6, 1, "delmq2", b"short")).await.unwrap();
+        let response = read_response(&mut client).await;
+        assert_eq!(response[0], 2, "DeleteM short payload: expected Failed");
+
+        stop_word.notify();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn server_list_messages_nonexistent_queue_responds_failure() {
+        let address = free_local_addr();
+        let drained = Arc::new(Notify::new());
+        let (stop_word, _) = start_server(make_config(address), drained).unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut client = TcpStream::connect(address).await.unwrap();
+
+        client.write_all(&encode_request(5, 1, "noqueue", &[])).await.unwrap();
+        let response = read_response(&mut client).await;
+        assert_eq!(response[0], 2, "ListM on nonexistent queue: expected Failed");
+
+        stop_word.notify();
+    }
 }

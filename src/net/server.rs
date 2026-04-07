@@ -20,6 +20,8 @@ const COMMAND_SIZE: usize = 1usize;
 const PAYLOAD_SIZE: usize = 8usize;
 const CLIENT_ID_SIZE: usize = 16usize;
 const QUEUE_NAME_SIZE: usize = 64usize;
+// Will, probably, be modified later in config
+static MAX_PAYLOAD_SIZE: u64 = 4 * 1024 * 1024 * 1024;
 type Job = Pin<Box<dyn Future<Output = ()> + Send>>;
 #[derive(Debug)]
 pub(crate) struct Pool {
@@ -170,14 +172,14 @@ pub(crate) struct RequestMessage {
     // or use it (e.g. for logging which command a queued message originated from).
     command: Request,
     payload_size: u64,
-    payload: Vec<u8>,
+    payload: BytesMut,
 }
 impl RequestMessage {
-    pub(crate) fn new(command: &Request, bytes: BytesMut) -> Result<Self, std::io::Error> {
+    pub(crate) fn new(command: &Request, mut bytes: BytesMut) -> Result<Self, std::io::Error> {
         Ok(Self {
             command:  command.to_owned(),
             payload_size: u64::from_be_bytes(bytes[COMMAND_SIZE+CLIENT_ID_SIZE..COMMAND_SIZE+CLIENT_ID_SIZE+PAYLOAD_SIZE].try_into().unwrap()),
-            payload: bytes[COMMAND_SIZE+CLIENT_ID_SIZE+PAYLOAD_SIZE+QUEUE_NAME_SIZE..].to_vec(),
+            payload: bytes.split_off(COMMAND_SIZE+CLIENT_ID_SIZE+PAYLOAD_SIZE+QUEUE_NAME_SIZE),
         })
     }
 }
@@ -199,7 +201,7 @@ impl ResponseMessage {
         let mut bytes: Vec<u8> = Vec::new();
         bytes.push(self.status.clone() as u8);
         bytes.append(&mut self.payload_size.to_be_bytes().to_vec());
-        bytes.append(&mut self.payload.clone());
+        bytes.append(&mut self.payload.to_vec());
         bytes
     }
 }
@@ -408,6 +410,12 @@ impl Server {
                 let command = command.unwrap();
                 let client_id = u128::from_be_bytes(buffer[COMMAND_SIZE..(COMMAND_SIZE+CLIENT_ID_SIZE)].try_into().unwrap());
                 let payload_size = u64::from_be_bytes(buffer[(COMMAND_SIZE+CLIENT_ID_SIZE)..(COMMAND_SIZE+CLIENT_ID_SIZE+PAYLOAD_SIZE)].try_into().unwrap());
+                if payload_size > MAX_PAYLOAD_SIZE {
+                    let response = ResponseMessage::new(Response::Failed, vec!());
+                    self.clone().send_response(writer, &response).await;
+                    println!("[worker {:?}] read buffer error MAX_PAYLOAD_SIZE reached", std::thread::current().id());
+                    return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Failed to read buffer"));
+                }
                 if buffer.len() < payload_size as usize + (COMMAND_SIZE+CLIENT_ID_SIZE+PAYLOAD_SIZE+QUEUE_NAME_SIZE) {
                     break;
                 }
@@ -464,7 +472,8 @@ impl Server {
                     }
                     Request::CreateQ => {
                         let server = self.clone();
-                        if self.queue_names.read().await.contains_key(&queue_name) {
+                        let mut queue_names = self.queue_names.write().await;
+                        if queue_names.contains_key(&queue_name) {
                             tokio::spawn(async move {
                                 let response = ResponseMessage::new(Response::Failed, vec!());
                                 server.send_response(writer, &response).await;
@@ -474,7 +483,7 @@ impl Server {
                         else
                         {
                             let hash = Uuid::new_v4();
-                            self.queue_names.write().await.insert(queue_name, hash);
+                            queue_names.insert(queue_name, hash);
                             self.queue.write().await.insert(hash, Arc::new(Mutex::new(Queue::new())));
                             tokio::spawn(async move {
                                 let response = ResponseMessage::new(Response::Succeeded, vec!());
@@ -484,9 +493,10 @@ impl Server {
                     }
                     Request::DeleteQ => {
                         let server = self.clone();
-                        if self.queue_names.read().await.contains_key(&queue_name) {
-                            let hash = self.queue_names.read().await.get(&queue_name).unwrap().clone();
-                            self.queue_names.write().await.remove(&queue_name);
+                        let mut queue_names = self.queue_names.write().await;
+                        if queue_names.contains_key(&queue_name) {
+                            let hash = queue_names.get(&queue_name).unwrap().clone();
+                            queue_names.remove(&queue_name);
                             self.queue.write().await.remove(&hash);
                             tokio::spawn(async move {
                                 let response = ResponseMessage::new(Response::Succeeded, vec!());
@@ -642,7 +652,7 @@ impl Server {
                     Request::UpdateM => {
                         let server = self.clone();
                         tokio::spawn(async move {
-                            let Some(message) = server.get_message(message)
+                            let Some(mut message) = server.get_message(message)
                             else {
                                 send_failed!(server, writer)
                             };
@@ -651,7 +661,7 @@ impl Server {
                             }
                             let bytes: [u8; 16] = message.payload[..16].try_into().unwrap();
                             let message_id = u128::from_be_bytes(bytes);
-                            let payload = message.payload[16..].to_vec();
+                            let payload = message.payload.split_off(16);
                             match server.get_queue(&queue_name).await {
                                 Ok(queue) => {
                                     match queue.lock().await.update_message(message_id, payload) {

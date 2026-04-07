@@ -2,6 +2,10 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Review Rules
+
+- **Do not modify source code** unless explicitly asked. During reviews: leave/modify/remove TODOs freely, add/update/remove tests freely, and document suggested fixes in CLAUDE.md — but do not change actual logic or code.
+
 ## Project Overview
 
 DataBroker is a tutorial Rust TCP-based message queue. Clients connect and issue commands over a binary protocol. Named queues are shared across all connected clients. It's explicitly a learning project — the codebase contains many TODO comments documenting known bugs and design issues.
@@ -91,5 +95,5 @@ cargo test --release -- --ignored --nocapture
 - `command` field in `RequestMessage` is stored but never read after construction
 - `PROC_LIMIT` is parsed but never used
 - On `u128` ID overflow, `enqueue` wraps the next ID back to 1, which may collide with an older message still in `self.queue` and silently overwrite it (see `TODO(note)` in `src/net/queue.rs`)
-- `read_buffer` has no upper bound on `payload_size`, so a client can request an arbitrarily large `BytesMut` allocation (DoS surface)
+- `read_buffer` has a `MAX_PAYLOAD_SIZE` guard (4 GB) that rejects oversized payloads before buffering
 - Per-queue `auto_fail`: when enabled, after a Dequeue the server sleeps for `fail_timeout` **milliseconds** and then NACKs the just-sent message via `Queue::unlock`, putting it back on the queue for redelivery. An `is_locked` guard (held under the same Mutex acquisition as `unlock`) prevents both panic and stale NACK if the client acks first.
