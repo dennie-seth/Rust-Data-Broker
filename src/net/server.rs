@@ -291,12 +291,6 @@ impl Server {
         println!("New connection from {}", addr);
         pool.spawn(async move { self.handle_connection(socket, stop_word.clone()).await }).await
     }
-    // TODO(bug): get_queue returns a cloned Arc<Mutex<Queue>>. After this returns, a
-    // concurrent DeleteQ can remove the queue from both maps. All handlers that use
-    // get_queue (Enqueue, Dequeue, DeleteM, Succeeded, Failed, Requeue, UpdateM, UpdateQ)
-    // then operate on an orphaned queue — writes succeed silently but data is lost.
-    // Fix: either hold the read guard for the duration of the operation, or accept this
-    // as a benign race (the operation was in-flight when the delete happened).
     async fn get_queue(&self, queue_lock: &RwLockReadGuard<'_, HashMap<Uuid, Arc<Mutex<Queue>>>> , queue_name: &String) -> Result<Arc<Mutex<Queue>>, ErrorCode> {
         let hash = self.queue_names.read().await.get(queue_name).cloned();
         match hash {
@@ -338,6 +332,7 @@ impl Server {
             if duration == 0u64 {
                 return Ok(())
             }
+            drop(lock);
             tokio::time::sleep(Duration::from_millis(duration)).await;
             {
                 let mut lock= queue.lock().await;
@@ -722,15 +717,12 @@ impl Server {
                                     let payload = message.payload.to_vec();
                                     match NetQueueConfig::from_be_bytes(payload) {
                                         Ok((net_queue_config, _)) => {
-                                            // TODO(bug): auto_fail and fail_timeout are updated under
-                                            // separate lock acquisitions. A concurrent Dequeue between
-                                            // them can read a half-updated config. Fix: hold a single
-                                            // lock for both updates.
+                                            let mut lock = queue.lock().await;
                                             if net_queue_config.auto_fail().is_some() {
-                                                queue.lock().await.update_config_auto_fail(net_queue_config.auto_fail().unwrap());
+                                                lock.update_config_auto_fail(net_queue_config.auto_fail().unwrap());
                                             }
                                             if net_queue_config.fail_timeout().is_some() {
-                                                queue.lock().await.update_config_fail_timeout(net_queue_config.fail_timeout().unwrap());
+                                                lock.update_config_fail_timeout(net_queue_config.fail_timeout().unwrap());
                                             }
                                             let response = ResponseMessage::new(Response::Succeeded, vec!());
                                             server.clone().send_response(writer, &response).await;
