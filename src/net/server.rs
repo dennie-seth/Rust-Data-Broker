@@ -16,6 +16,7 @@ use uuid::Uuid;
 use crate::config::Config;
 use crate::errors::ErrorCode;
 use crate::errors::ErrorCode::{RequestParseError, ResponseFailedError};
+use crate::net::net_stats::StatWatcher;
 use crate::net::queue::{NetQueueConfig, Queue};
 
 const COMMAND_SIZE: usize = 1usize;
@@ -125,6 +126,7 @@ pub(crate) enum Request {
     Requeue = 9,
     UpdateM = 10,
     UpdateQ = 11,
+    NetStats = 12,
 }
 impl Request {
     pub(crate) fn from_u8(value: u8) -> Result<Self, std::io::Error> {
@@ -140,6 +142,7 @@ impl Request {
             9 => Ok(Request::Requeue),
             10 => Ok(Request::UpdateM),
             11 => Ok(Request::UpdateQ),
+            12 => Ok(Request::NetStats),
             _ => Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Unknown request type")),
         }
     }
@@ -740,6 +743,30 @@ impl Server {
                                     println!("[worker {:?}] update queue error {}", std::thread::current().id(), err);
                                 }
                             }
+                        });
+                    }
+                    Request::NetStats => {
+                        let server = self.clone();
+                        tokio::spawn(async move {
+                            let names_lock = server.queue_names.read().await;
+                            let queue_lock = server.queue.read().await;
+                            let mut stat_watcher = StatWatcher::new();
+                            for (name, hash) in names_lock.iter() {
+                                if queue_lock.contains_key(hash) {
+                                    let queue = queue_lock.get(hash).unwrap();
+                                    match stat_watcher.new_stat(name.clone(), queue).await {
+                                        Ok(_) => {}
+                                        Err(err) => {
+                                            let response = ResponseMessage::new(Response::Failed, err.to_payload());
+                                            server.clone().send_response(writer, &response).await;
+                                            println!("Queue stats failed!");
+                                            return;
+                                        }
+                                    }
+                                }
+                            }
+                            let response = ResponseMessage::new(Response::Succeeded, stat_watcher.to_bytes());
+                            server.clone().send_response(writer, &response).await;
                         });
                     }
                 }

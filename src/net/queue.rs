@@ -1,9 +1,9 @@
 use std::collections::{HashMap};
 use std::io::ErrorKind;
+use std::iter::Sum;
 use std::sync::Arc;
 use bytes::BytesMut;
 use tokio::sync::RwLock;
-use uuid::Bytes;
 
 const MAGIC_DRAIN_VEC: usize = 10usize;
 const NET_QUEUE_CONFIG_SIZE: usize = 1usize + 1usize + 8usize;
@@ -60,6 +60,14 @@ impl QueueMessage {
     pub fn unlock(&mut self) {
         self.locked_by = None
     }
+    pub fn deep_size_of(&self) -> usize {
+        let mut result = self.payload.capacity();
+        result += std::mem::size_of::<u128>(); // self.publisher_id
+        result += std::mem::size_of::<u64>(); // self.timestamp
+        result += std::mem::size_of::<Option<u128>>(); // self.locked_by
+
+        result
+    }
 }
 impl PartialEq<u128> for QueueMessage {
     fn eq(&self, client_id: &u128) -> bool {
@@ -76,11 +84,11 @@ impl MessageMeta {
         }
     }
     pub fn to_be_bytes(&self) -> Vec<u8> {
-        let mut bytes = Vec::new();
-        bytes.append(&mut self.id.to_be_bytes().to_vec());
-        bytes.append(&mut self.publisher_id.to_be_bytes().to_vec());
-        bytes.append(&mut self.timestamp.to_be_bytes().to_vec());
-        bytes.append(&mut self.locked_by.map_or(u128::MAX, |id| id).to_be_bytes().to_vec());
+        let mut bytes = Vec::with_capacity(56);
+        bytes.extend_from_slice(&mut self.id.to_be_bytes());
+        bytes.extend_from_slice(&mut self.publisher_id.to_be_bytes());
+        bytes.extend_from_slice(&mut self.timestamp.to_be_bytes());
+        bytes.extend_from_slice(&mut self.locked_by.map_or(u128::MAX, |id| id).to_be_bytes());
         bytes
     }
 }
@@ -180,7 +188,7 @@ impl Queue {
             let (result, _) = self.order.last().unwrap().overflowing_add(1);
             // TODO(note): On u128 overflow, result wraps to 0. If messages with low IDs are still
             //            in the queue, this produces a duplicate ID and silently overwrites the
-            //            existing entry in self.queue. This is expected behavior - if the message 
+            //            existing entry in self.queue. This is expected behavior - if the message
             //            stays in queue for so long, it should be deleted by design.
             id = result;
             if id == 0 {
@@ -226,9 +234,9 @@ impl Queue {
 
         let mut iter = self.order.iter();
         let _ = iter.find(|&&i| i == self.next_id.unwrap());
-        match Some(iter.next()) {
+        match iter.next() {
             Some(id) => {
-                self.next_id = id.copied();
+                self.next_id = Some(*id);
                 if self.next_id == Some(0) {
                     self.next_id = self.order.iter().find(|&&x| x != 0).copied();
                 }
@@ -417,6 +425,22 @@ impl Queue {
         }
         Ok(())
     }
+    pub fn get_total_messages(&self) -> Result<usize, std::io::Error> {
+        Ok(self.queue.len())
+    }
+    pub async fn get_total_bytes(&self) -> Result<usize, std::io::Error> {
+        Ok(self.deep_size_of().await)
+    }
+    pub async fn get_total_messages_locked(&self) -> Result<usize, std::io::Error> {
+        let mut result = 0;
+        for value in self.locked.values() {
+            result += value.read().await.len();
+        }
+        Ok(result)
+    }
+    pub async fn get_total_bytes_locked(&self) -> Result<usize, std::io::Error> {
+        Ok(self.deep_size_of_locked().await)
+    }
     fn remove_zeroes(&mut self) {
         if self.order.len() >= MAGIC_DRAIN_VEC {
             let mut iter = self.order.iter();
@@ -429,6 +453,44 @@ impl Queue {
                 self.order.drain(..);
             }
         }
+    }
+    async fn deep_size_of(&self) -> usize {
+        // order capacity
+        let mut result = self.order.capacity() * std::mem::size_of::<u128>();
+        // queue size capacity
+        let queue_capacity = ((self.queue.capacity() * std::mem::size_of::<u128>()) as f64 * 1.25f64) as usize +
+            self.queue.values().map(|message| message.deep_size_of()).sum::<usize>();
+        result += queue_capacity;
+        // locked capacity
+        result += self.locked_capacity().await;
+
+        result
+    }
+    async fn deep_size_of_locked(&self) -> usize {
+        let mut result = 0usize;
+        // queue locked capacity
+        let mut ids = 0usize;
+        for (_, value) in self.queue.iter() {
+            if value.is_locked() {
+                ids += 1;
+                result += value.deep_size_of();
+            }
+        }
+        result += ((ids * std::mem::size_of::<u128>()) as f64 * 1.25f64) as usize;
+        // locked capacity
+        result += self.locked_capacity().await;
+        
+        result
+    }
+    async fn locked_capacity(&self) -> usize {
+        let mut locked_capacity = ((self.locked.capacity() * std::mem::size_of::<u128>()) as f64 * 1.25f64) as usize +
+            self.locked.capacity() * std::mem::size_of::<Arc<RwLock<Vec<u128>>>>();
+        let values = self.locked.values();
+        for value in values {
+            locked_capacity += value.read().await.capacity() * std::mem::size_of::<u128>();
+        }
+        
+        locked_capacity
     }
 }
 fn get_meta_as_vec(message_id: u128, message: &QueueMessage) -> Vec<u8> {

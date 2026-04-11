@@ -1,5 +1,30 @@
 # Changelog
 
+## [0.5.3] - 2026-04-11
+
+### Bug Fixes
+
+#### NetStats payload framing (`src/net/net_stats.rs`)
+- `StatMessage::to_bytes` previously never wrote `self.queue_name` at all — it wrote the constant `size_of::<u64>() = 8` as 8 BE bytes where the name should have gone, followed by four raw `usize` fields with no delimiter. Clients had no way to parse the payload. Now writes `[2 BE u16 name_len][name bytes]` before the four stat fields.
+- `StatWatcher::to_bytes` previously concatenated `StatMessage` byte streams with no count header or per-entry framing. Now prefixes the payload with `[4 BE u32 count]` and each entry with `[4 BE u32 entry_len]`, making the full `NetStats` response decodable.
+- Remaining known issue: the four numeric stat fields are still serialized as `usize`, which is 4 bytes on 32-bit targets and 8 bytes on 64-bit — a cross-target client cannot parse them reliably. Tracked in Known Design Limitations.
+
+### Tests
+
+#### `server_net_stats_responds_success` (`src/tests/server_tests.rs`)
+- Upgraded from a status-byte smoke test to a full payload decoder: reads the `u32` count header, the per-entry `u32` length prefix, the `u16` length-prefixed queue name, and the four `usize` stat fields, and asserts `count == 1`, `name == "statq"`, `total_messages == 1`, `total_messages_locked == 0`.
+
+### Documentation
+
+#### `CLAUDE.md`
+- `NetStats` row in the command table rewritten to document the new payload format (`[count][entry_len][name_len][name][stats]`).
+- Known Design Limitations: removed four now-fixed items (`QueueMessage::deep_size_of` × 32 inflation, `Queue::get_total_messages` / `get_total_messages_locked` returning HashMap capacity, `lock_to_read` dead `None` arm, full `NetStats` unparseable framing). Added two new entries: the residual platform-dependent `usize` in `NetStats` stat fields, and the `Queue::enqueue` tombstone-derived ID collision (when the trailing slot of `self.order` is `0`, the next id resolves to `1` and overwrites an existing `id=1` message).
+
+### Internal
+- Stale `TODO(bug)` comments removed from `src/net/queue.rs` for fixes that had already landed (`QueueMessage::deep_size_of`, `lock_to_read` iterator shape, `Queue::get_total_messages`, `Queue::get_total_messages_locked`).
+- New `TODO(bug)` added in `Queue::enqueue` describing the tombstone ID-collision bug.
+- `StatMessage::to_bytes` TODO replaced with a narrower note about the platform-dependent `usize` stat fields; `StatWatcher::to_bytes` TODO removed (framing now has count + per-entry length prefix).
+
 ## [0.5.0] - 2026-04-06
 
 ### Breaking Changes
