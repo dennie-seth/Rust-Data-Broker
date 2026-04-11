@@ -29,6 +29,8 @@ pub enum ErrorCode {
     QueueDoesNotExist           = 103,
     /// Queue is empty — no messages to operate on.
     QueueIsEmpty                = 104,
+    /// Failed to get queue stats
+    QueueStatsFailed            = 105,
 
     // ── 200–299: Message-level errors ─────────────────────────────────
     /// Payload is too short to contain a 16-byte message ID.
@@ -75,6 +77,7 @@ impl ErrorCode {
             102 => Some(Self::QueueAlreadyExists),
             103 => Some(Self::QueueDoesNotExist),
             104 => Some(Self::QueueIsEmpty),
+            105 => Some(Self::QueueStatsFailed),
             200 => Some(Self::PayloadMissingMessageId),
             201 => Some(Self::NoSuchMessageId),
             202 => Some(Self::MessageAlreadyLocked),
@@ -102,6 +105,7 @@ impl std::fmt::Display for ErrorCode {
             Self::QueueAlreadyExists        => write!(f, "Queue already created"),
             Self::QueueDoesNotExist         => write!(f, "Queue does not exist"),
             Self::QueueIsEmpty              => write!(f, "Queue is empty"),
+            Self::QueueStatsFailed          => write!(f, "Statistics failed"),
             Self::PayloadMissingMessageId   => write!(f, "Payload doesn't contain message_id"),
             Self::NoSuchMessageId           => write!(f, "No such message id"),
             Self::MessageAlreadyLocked      => write!(f, "Queue message already locked"),
