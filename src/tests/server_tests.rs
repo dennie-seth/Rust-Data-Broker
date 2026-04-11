@@ -900,7 +900,7 @@ mod tests {
         // where each entry is:
         //   [4 BE u32 entry_len][2 BE u16 name_len][name bytes][4 × usize stats]
         // Note: the numeric fields are serialized as platform-dependent `usize`, so
-        // this test assumes a 64-bit target (see TODO(bug) in net_stats.rs).
+        // this test assumes a 64-bit target.
         let address = free_local_addr();
         let drained = Arc::new(Notify::new());
         let (stop_word, _) = start_server(make_config(address), drained).unwrap();
