@@ -31,7 +31,9 @@ impl StatMessage {
     }
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut bytes = vec!();
-        bytes.extend(self.queue_name.as_bytes());
+        let name = self.queue_name.as_bytes();
+        bytes.extend((name.len() as u16).to_be_bytes());
+        bytes.extend(name);
         bytes.extend(self.total_messages.to_be_bytes());
         bytes.extend(self.total_bytes.to_be_bytes());
         bytes.extend(self.total_messages_locked.to_be_bytes());
@@ -70,7 +72,7 @@ impl StatWatcher {
             }
         }
         let total_messages_locked;
-        match lock.get_total_messages_locked() {
+        match lock.get_total_messages_locked().await {
             Ok(amount) => {
                 total_messages_locked = amount;
             }
@@ -95,7 +97,13 @@ impl StatWatcher {
     }
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut bytes = vec!();
-        bytes.extend(self.stat_messages.iter().flat_map(|m| m.to_bytes()));
+        bytes.extend((self.stat_messages.len() as u32).to_be_bytes());
+        for message in self.stat_messages.iter() {
+            let message_bytes = message.to_bytes();
+            bytes.extend((message_bytes.len() as u32).to_be_bytes());
+            bytes.extend(message_bytes);
+        }
+
         bytes
     }
 }

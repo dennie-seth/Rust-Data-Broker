@@ -30,9 +30,9 @@ mod tests {
     /// Encodes a request using the full wire protocol:
     /// [1 byte command][16 bytes client_id][8 bytes payload_size][64 bytes queue_name][payload]
     ///
-    /// Note: queue_name is null-padded to 64 bytes. Pre-configured queues (from Config::queue_names)
-    /// are stored without padding and will NOT match wire-format lookups — always use CreateQ (3)
-    /// in tests to create queues so both sides use the same padded key.
+    /// Note: queue_name is null-padded to 64 bytes on the wire. The server trims trailing
+    /// '\0' bytes before looking up the queue, so wire-format names match unpadded keys
+    /// (including pre-configured queues from Config::queue_names).
     fn encode_request(command: u8, client_id: u128, queue_name: &str, payload: &[u8]) -> Vec<u8> {
         let mut buf = Vec::new();
         buf.push(command);
@@ -867,6 +867,78 @@ mod tests {
         client.write_all(&encode_request(9, 1, "reqq2", b"short")).await.unwrap();
         let response = read_response(&mut client).await;
         assert_eq!(response[0], 2, "Requeue short payload: expected Failed");
+
+        stop_word.notify();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn server_preconfigured_queue_matches_wire_name() {
+        // Regression: queues pre-created from Config::queue_names (unpadded keys)
+        // must be reachable via wire-format lookups (null-padded names), because the
+        // server trims trailing '\0' before hashing the name.
+        let address = free_local_addr();
+        let mut config = make_config(address);
+        config.queue_names = vec!["preq".to_string()];
+        let drained = Arc::new(Notify::new());
+        let (stop_word, _) = start_server(config, drained).unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut client = TcpStream::connect(address).await.unwrap();
+
+        // Enqueue directly into the pre-created queue — no CreateQ needed.
+        client.write_all(&encode_request(1, 1, "preq", b"hi")).await.unwrap();
+        let response = read_response(&mut client).await;
+        assert_eq!(response[0], 1, "Enqueue into preconfigured queue: expected Succeeded");
+
+        stop_word.notify();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn server_net_stats_responds_success() {
+        // NetStats (12) returns a Succeeded response whose payload is:
+        //   [4 BE u32 count][entries...]
+        // where each entry is:
+        //   [4 BE u32 entry_len][2 BE u16 name_len][name bytes][4 × usize stats]
+        // Note: the numeric fields are serialized as platform-dependent `usize`, so
+        // this test assumes a 64-bit target (see TODO(bug) in net_stats.rs).
+        let address = free_local_addr();
+        let drained = Arc::new(Notify::new());
+        let (stop_word, _) = start_server(make_config(address), drained).unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut client = TcpStream::connect(address).await.unwrap();
+
+        client.write_all(&encode_request(3, 1, "statq", &[])).await.unwrap();
+        let response = read_response(&mut client).await;
+        assert_eq!(response[0], 1, "CreateQ: expected Succeeded");
+
+        client.write_all(&encode_request(1, 1, "statq", b"payload")).await.unwrap();
+        let response = read_response(&mut client).await;
+        assert_eq!(response[0], 1, "Enqueue: expected Succeeded");
+
+        client.write_all(&encode_request(12, 1, "statq", &[])).await.unwrap();
+        let response = read_response(&mut client).await;
+        assert_eq!(response[0], 1, "NetStats: expected Succeeded");
+
+        let payload = &response[9..];
+        let count = u32::from_be_bytes(payload[0..4].try_into().unwrap());
+        assert_eq!(count, 1, "expected 1 stat entry");
+        let entry_len = u32::from_be_bytes(payload[4..8].try_into().unwrap()) as usize;
+        let entry = &payload[8..8 + entry_len];
+        let name_len = u16::from_be_bytes(entry[0..2].try_into().unwrap()) as usize;
+        let name = std::str::from_utf8(&entry[2..2 + name_len]).unwrap();
+        assert_eq!(name, "statq");
+        let mut off = 2 + name_len;
+        let payload = entry;
+        let total_messages = usize::from_be_bytes(payload[off..off + 8].try_into().unwrap());
+        assert_eq!(total_messages, 1, "expected 1 message enqueued");
+        off += 8;
+        let _total_bytes = usize::from_be_bytes(payload[off..off + 8].try_into().unwrap());
+        off += 8;
+        let total_messages_locked = usize::from_be_bytes(payload[off..off + 8].try_into().unwrap());
+        assert_eq!(total_messages_locked, 0, "no messages locked");
+        off += 8;
+        let _total_bytes_locked = usize::from_be_bytes(payload[off..off + 8].try_into().unwrap());
 
         stop_word.notify();
     }

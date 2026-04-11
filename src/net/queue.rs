@@ -61,7 +61,7 @@ impl QueueMessage {
         self.locked_by = None
     }
     pub fn deep_size_of(&self) -> usize {
-        let mut result = self.payload.capacity() * std::mem::size_of::<BytesMut>();
+        let mut result = self.payload.capacity();
         result += std::mem::size_of::<u128>(); // self.publisher_id
         result += std::mem::size_of::<u64>(); // self.timestamp
         result += std::mem::size_of::<Option<u128>>(); // self.locked_by
@@ -188,7 +188,7 @@ impl Queue {
             let (result, _) = self.order.last().unwrap().overflowing_add(1);
             // TODO(note): On u128 overflow, result wraps to 0. If messages with low IDs are still
             //            in the queue, this produces a duplicate ID and silently overwrites the
-            //            existing entry in self.queue. This is expected behavior - if the message 
+            //            existing entry in self.queue. This is expected behavior - if the message
             //            stays in queue for so long, it should be deleted by design.
             id = result;
             if id == 0 {
@@ -234,9 +234,9 @@ impl Queue {
 
         let mut iter = self.order.iter();
         let _ = iter.find(|&&i| i == self.next_id.unwrap());
-        match Some(iter.next()) {
+        match iter.next() {
             Some(id) => {
-                self.next_id = id.copied();
+                self.next_id = Some(*id);
                 if self.next_id == Some(0) {
                     self.next_id = self.order.iter().find(|&&x| x != 0).copied();
                 }
@@ -426,13 +426,17 @@ impl Queue {
         Ok(())
     }
     pub fn get_total_messages(&self) -> Result<usize, std::io::Error> {
-        Ok(self.queue.capacity())
+        Ok(self.queue.len())
     }
     pub async fn get_total_bytes(&self) -> Result<usize, std::io::Error> {
         Ok(self.deep_size_of().await)
     }
-    pub fn get_total_messages_locked(&self) -> Result<usize, std::io::Error> {
-        Ok(self.locked.capacity())
+    pub async fn get_total_messages_locked(&self) -> Result<usize, std::io::Error> {
+        let mut result = 0;
+        for value in self.locked.values() {
+            result += value.read().await.len();
+        }
+        Ok(result)
     }
     pub async fn get_total_bytes_locked(&self) -> Result<usize, std::io::Error> {
         Ok(self.deep_size_of_locked().await)

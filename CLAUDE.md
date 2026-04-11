@@ -59,6 +59,7 @@ cargo test --release -- --ignored --nocapture
 | Requeue | 9 | Move a message to the end of the queue (payload = 16-byte message ID) |
 | UpdateM | 10 | Update a message's payload (payload = 16-byte message ID + new payload) |
 | UpdateQ | 11 | Update per-queue config (payload = `NetQueueConfig`: 1 byte flags + optional `auto_fail: u8` + optional `fail_timeout: u64 BE`) |
+| NetStats | 12 | Return per-queue stats: total messages, total bytes, locked messages, locked bytes. Payload: `[4 BE u32 count][entries...]` where each entry is `[4 BE u32 entry_len][2 BE u16 name_len][name bytes][4 × usize total_messages/total_bytes/total_messages_locked/total_bytes_locked]`. Numeric fields are `usize`, so width is platform-dependent — see Known Design Limitations. |
 
 **Response:** `[1 byte status][8 bytes payload_size][payload]`
 - Status `1` = Succeeded, `2` = Failed
@@ -72,6 +73,7 @@ cargo test --release -- --ignored --nocapture
 | `Server` | `src/net/server.rs` | TCP listener; accepts connections and hands to `Pool` |
 | `Pool` | `src/net/server.rs` | Worker thread pool with pressure-based dispatch |
 | `Queue` | `src/net/queue.rs` | Named message queue with lock-to-read / ack semantics |
+| `StatWatcher` | `src/net/net_stats.rs` | Per-queue stats collector used to build the `NetStats` response payload |
 | `ErrorCode` | `src/errors.rs` | `#[repr(u16)]` enum of typed error codes returned in Failed response payloads |
 
 ### Tests
@@ -99,3 +101,5 @@ cargo test --release -- --ignored --nocapture
 - On `u128` ID overflow, `enqueue` wraps the next ID back to 1, which may collide with an older message still in `self.queue` and silently overwrite it (see `TODO(note)` in `src/net/queue.rs`)
 - `read_buffer` has a `MAX_PAYLOAD_SIZE` guard (4 GB) that rejects oversized payloads before buffering
 - Per-queue `auto_fail`: when enabled, after a Dequeue the server sleeps for `fail_timeout` **milliseconds** and then NACKs the just-sent message via `Queue::unlock`, putting it back on the queue for redelivery. An `is_locked` guard (held under the same Mutex acquisition as `unlock`) prevents both panic and stale NACK if the client acks first.
+- `NetStats` response payload: `StatMessage::to_bytes` now length-prefixes the queue name (2-byte BE u16 + bytes) and `StatWatcher::to_bytes` emits a `u32` BE count header followed by length-prefixed entries, so the payload is decodable in principle. The four numeric stat fields are still serialized as `usize`, which is platform-dependent (4 bytes on 32-bit targets, 8 on 64-bit) — a client on a different target cannot parse them reliably until they are cast to `u64` before `to_be_bytes()`.
+- `Queue::enqueue` derives the next message id from `self.order.last()`, but specific-id dequeue paths leave tombstone `0`s in `self.order` rather than removing the slot. If the trailing slot is a tombstone, the next id resolves to `1` and silently overwrites an existing `id=1` entry in `self.queue`. Should derive the next id from the max non-zero entry in `self.order`, or from a monotonic counter owned by `Queue`.
