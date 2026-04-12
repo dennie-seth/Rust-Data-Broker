@@ -163,9 +163,25 @@ impl MemAllocator {
                 let node_size = (*node).size;
                 if node_size >= needed {
                     *prev = (*node).next;
-                    drop(head);
 
+                    let leftover = node_size - needed;
+                    if leftover >= MIN_SLOT_SIZE {
+                        let remainder = (node as *mut u8).add(needed) as *mut FreeNode;
+                        (*remainder).size = leftover;
+                        (*remainder).next = *prev;
+                        *prev = remainder;
+
+                        drop(head);
+                        let slot = node as *mut u8;
+                        return Some(place_header(slot, needed, layout));
+                    }
+
+                    drop(head);
                     let slot = node as *mut u8;
+                    let excess = node_size - needed;
+                    if excess > 0 {
+                        self.used.fetch_add(excess, Ordering::Relaxed);
+                    }
                     return Some(place_header(slot, node_size, layout));
                 }
                 prev = &mut (*node).next;

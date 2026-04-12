@@ -8,6 +8,7 @@ pub struct Config
     pub threads_limit: u64,
     pub proc_limit: u64,
     pub wait_limit: u64,
+    pub memory_limit: u64,
     pub server_addr: String,
     pub server_port: String,
     pub queue_names: Vec<String>,
@@ -33,6 +34,7 @@ pub(crate) fn parse_config(path: &str) -> Result<Config ,Box<dyn std::error::Err
                 // from both the Config struct and the .settings file to avoid confusion.
                 proc_limit: data.get("PROC_LIMIT").ok_or("missing PROC_LIMIT") ?.parse:: < u64>()?,
                 wait_limit: data.get("WAIT_LIMIT").ok_or("missing WAIT_LIMIT") ?.parse:: < u64>()?,
+                memory_limit: data.get("MEMORY_LIMIT").ok_or("missing MEMORY_LIMIT")?.parse::<u64>()?,
                 server_addr: data.get("SERVER_ADDR").ok_or("missing SERVER_ADDR") ?.to_string(),
                 server_port: data.get("SERVER_PORT").ok_or("missing SERVER_PORT")?.to_string(),
                 queue_names: data.get("QUEUE_NAMES").ok_or_else(|| "")?.split(',').filter(|s| !s.is_empty()).map(|s| s.to_string()).collect(),
