@@ -2,6 +2,7 @@ mod net;
 mod config;
 mod tests;
 mod errors;
+mod memory;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -9,6 +10,7 @@ use std::time::Duration;
 use tokio::signal;
 use tokio::time::timeout;
 use crate::config::parse_config;
+use crate::memory::allocator::init;
 use crate::net::server::{start_server, Notify};
 
 #[tokio::main(flavor = "multi_thread")]
@@ -36,6 +38,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = parse_config(config_path.to_str().unwrap())?;
     // endregion
 
+    // region: memory allocation
+    init(config.memory_limit as usize);
+    // endregion
+    
     // region: server launch
     let drained = Arc::new(Notify::new());
     let (stop_word, stop_accepting) = start_server(config, drained.clone())?;

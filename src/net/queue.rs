@@ -1,6 +1,5 @@
 use std::collections::{HashMap};
 use std::io::ErrorKind;
-use std::iter::Sum;
 use std::sync::Arc;
 use bytes::BytesMut;
 use tokio::sync::RwLock;
@@ -39,6 +38,7 @@ pub(crate) struct Queue {
     locked: HashMap<u128, Arc<RwLock<Vec<u128>>>>,
     next_id: Option<u128>, // next non-locked message
     config: QueueConfig,
+    biggest_payloads: [usize; 5],
 }
 impl QueueMessage {
     pub fn new(payload: BytesMut, publisher_id: u128) -> Self {
@@ -165,6 +165,7 @@ impl Queue {
             locked: HashMap::new(),
             next_id: None,
             config: QueueConfig::new(),
+            biggest_payloads: [0; 5],
         }
     }
     pub fn get_config_auto_fail(&self) -> bool {
@@ -252,7 +253,7 @@ impl Queue {
         }
         Ok((payload, message_id))
     }
-    pub async fn dequeue(&mut self, client_id: u128, message_id: Option<u128>) -> Result<(), std::io::Error> {
+    pub async fn dequeue(&mut self, client_id: u128, message_id: Option<u128>) -> Result<usize, std::io::Error> {
         if self.order.is_empty() {
             return Err(std::io::Error::new(ErrorKind::InvalidData, "Queue is empty"));
         }
@@ -277,7 +278,7 @@ impl Queue {
                     }
                 }
             }
-            self.queue.remove(&message_id.unwrap());
+            let message = self.queue.remove(&message_id.unwrap());
             if self.locked.contains_key(&client_id) {
                 if self.locked.get(&client_id).unwrap().read().await.contains(&message_id.unwrap()) {
                     let id = self.locked.get(&client_id).unwrap().read().await.iter().position(|&x| x == message_id.unwrap());
@@ -291,12 +292,13 @@ impl Queue {
                     }
                 }
             }
-            return Ok(());
+            return Ok(message.unwrap().payload.len());
         }
+        let message;
         if let Some(ids) = self.locked.clone().get(&client_id) {
             let first = { ids.read().await.first().copied() };
             if let Some(id) = first {
-                self.queue.remove(&id);
+                message = self.queue.remove(&id);
                 if self.locked.contains_key(&client_id) {
                     self.locked.get(&client_id).unwrap().write().await.remove(0);
                     let mut iter = self.order.iter();
@@ -314,7 +316,7 @@ impl Queue {
         }
 
         self.remove_zeroes();
-        Ok(())
+        Ok(message.unwrap().payload.len())
     }
     pub async fn is_locked(&self, client_id: u128, message_id: u128) -> bool {
         if self.order.is_empty() {
@@ -424,6 +426,30 @@ impl Queue {
             }
         }
         Ok(())
+    }
+    pub fn get_next_biggest_payload(&mut self) -> Result<usize, std::io::Error> {
+        let result = self.biggest_payloads[4];
+        self.find_biggest_payloads();
+
+        Ok(result)
+    }
+    pub fn find_biggest_payloads(&mut self) {
+        for message in self.queue.values() {
+            let mut decr_id = 4i8;
+            while decr_id >= 0
+            {
+                if message.payload.len() > self.biggest_payloads[decr_id as usize] {
+                    let mut id = 0;
+                    while id < decr_id as usize {
+                        self.biggest_payloads[id] = self.biggest_payloads[id + 1];
+                        id += 1;
+                    }
+                    self.biggest_payloads[decr_id as usize] = message.payload.len();
+                    break;
+                }
+                decr_id -= 1;
+            }
+        }
     }
     pub fn get_total_messages(&self) -> Result<usize, std::io::Error> {
         Ok(self.queue.len())
