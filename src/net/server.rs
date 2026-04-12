@@ -14,7 +14,7 @@ use uuid::Uuid;
 use crate::config::Config;
 use crate::errors::ErrorCode;
 use crate::errors::ErrorCode::{ResponseFailedError};
-use crate::memory::allocator::LOCKED_SIZE;
+use crate::memory::allocator::{get_free_mem_size, set_locked_size, LOCKED_SIZE};
 use crate::net::net_stats::StatWatcher;
 use crate::net::queue::{NetQueueConfig, Queue};
 
@@ -366,7 +366,9 @@ impl Server {
                         if (size as f64 * SIZE_FACTOR) as usize >= LOCKED_SIZE.load(Ordering::Relaxed) {
                             match lock.get_next_biggest_payload() {
                                 Ok(size) => {
-                                    LOCKED_SIZE.store(size, Ordering::Release);
+                                    if !set_locked_size(size) {
+                                        println!("[worker {:?}] out of memory!", std::thread::current().id());
+                                    }
                                 },
                                 Err(err) => {
                                     println!("[worker {:?}] get_next_biggest_payload error {:?}", std::thread::current().id(), err);
@@ -428,10 +430,10 @@ impl Server {
                     println!("[worker {:?}] read buffer error {:?}", std::thread::current().id(), command.unwrap_err());
                     return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Failed to read buffer"));
                 }
-                let command = command.unwrap();
+                let command = command?;
                 let client_id = u128::from_be_bytes(buffer[COMMAND_SIZE..(COMMAND_SIZE+CLIENT_ID_SIZE)].try_into().unwrap());
                 let payload_size = u64::from_be_bytes(buffer[(COMMAND_SIZE+CLIENT_ID_SIZE)..(COMMAND_SIZE+CLIENT_ID_SIZE+PAYLOAD_SIZE)].try_into().unwrap());
-                if payload_size > MAX_PAYLOAD_SIZE {
+                if payload_size > MAX_PAYLOAD_SIZE || (payload_size as f64 * SIZE_FACTOR) as usize >= get_free_mem_size() {
                     let response = ResponseMessage::new(Response::Failed, ErrorCode::PayloadTooLarge.to_payload());
                     self.clone().send_response(writer, &response).await;
                     println!("[worker {:?}] read buffer error MAX_PAYLOAD_SIZE reached", std::thread::current().id());
@@ -463,7 +465,9 @@ impl Server {
                                         Ok(_) => {
                                             let size = (payload_size as f64 * SIZE_FACTOR) as usize;
                                             if  size > LOCKED_SIZE.load(Ordering::Relaxed) {
-                                                LOCKED_SIZE.store(size, Ordering::Release);
+                                                if !set_locked_size(size) {
+                                                    println!("[worker {:?}] out of memory!", std::thread::current().id());
+                                                }
                                             }
 
                                             let response = ResponseMessage::new(Response::Succeeded, vec!());

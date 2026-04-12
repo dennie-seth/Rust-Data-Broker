@@ -1,4 +1,4 @@
-use std::alloc::{GlobalAlloc, Layout};
+use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 use std::ptr::null_mut;
 use std::sync::Mutex;
@@ -77,7 +77,9 @@ unsafe impl GlobalAlloc for MemAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let base = ARENA_BASE.load(Ordering::Acquire);
         if base.is_null() {
-            return null_mut();
+            // Arena not initialized — fall back to the system allocator.
+            // Handles pre-main allocations and test builds where init() is never called.
+            return unsafe { System.alloc(layout) };
         }
         let needed = match required_slot_size(layout) {
             Some(size) => { size },
@@ -98,19 +100,27 @@ unsafe impl GlobalAlloc for MemAllocator {
         }
     }
 
-    unsafe fn dealloc(&self, ptr: *mut u8, _layout: Layout) {
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         let base = ARENA_BASE.load(Ordering::Acquire);
         if base.is_null() {
-            return;
+            // Arena not initialized — pointer was allocated by the system allocator.
+            return unsafe { System.dealloc(ptr, layout) };
         }
 
         unsafe {
+            let capacity = self.allocated.load(Ordering::Acquire);
+            // Quick range check BEFORE reading the in-slot header — if ptr is
+            // outside the arena, it was allocated by the system allocator
+            // (pre-init allocation). Delegate without touching the header bytes.
+            if ptr < base || ptr >= base.add(capacity) {
+                return System.dealloc(ptr, layout);
+            }
+
             let header_ptr = ptr.sub(size_of::<AllocHeader>()) as *const AllocHeader;
             let slot_offset = (*header_ptr).slot_offset;
             let slot_size = (*header_ptr).slot_size;
             let slot_start = ptr.sub(slot_offset);
 
-            let capacity = self.allocated.load(Ordering::Acquire);
             let arena_end = base.add(capacity);
             if slot_start < base || slot_start.add(slot_size) > arena_end {
                 return;
@@ -254,6 +264,15 @@ pub(crate) fn init(arena_size: usize) {
         name("arena-defrag".into()).
         spawn(defrag_thread).
         expect("Failed to spawn defrag thread");
+}
+pub(crate) fn get_free_mem_size() -> usize {
+    let allocated = GLOBAL.allocated.load(Ordering::Acquire);
+    if allocated == 0 {
+        return usize::MAX;
+    }
+    let used = GLOBAL.used.load(Ordering::Acquire);
+
+    allocated - used
 }
 #[cfg(unix)]
 pub fn init(arena_size: usize) {

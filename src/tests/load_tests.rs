@@ -24,6 +24,7 @@ mod tests {
             threads_limit: threads,
             proc_limit: 1,
             wait_limit: wait,
+            memory_limit: 0,
             server_addr: address.ip().to_string(),
             server_port: address.port().to_string(),
             queue_names: vec![],

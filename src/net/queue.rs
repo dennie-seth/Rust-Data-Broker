@@ -440,11 +440,12 @@ impl Queue {
             {
                 if message.payload.len() > self.biggest_payloads[decr_id as usize] {
                     let mut id = 0;
-                    while id < 4 {
+                    while id < decr_id as usize {
                         self.biggest_payloads[id] = self.biggest_payloads[id + 1];
                         id += 1;
                     }
                     self.biggest_payloads[decr_id as usize] = message.payload.len();
+                    break;
                 }
                 decr_id -= 1;
             }

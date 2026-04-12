@@ -75,6 +75,7 @@ cargo test --release -- --ignored --nocapture
 | `Queue` | `src/net/queue.rs` | Named message queue with lock-to-read / ack semantics |
 | `StatWatcher` | `src/net/net_stats.rs` | Per-queue stats collector used to build the `NetStats` response payload |
 | `ErrorCode` | `src/errors.rs` | `#[repr(u16)]` enum of typed error codes returned in Failed response payloads |
+| `MemAllocator` | `src/memory/allocator.rs` | `#[global_allocator]` — bump allocator with first-fit free-list reuse, background defragmentation, and system allocator fallback pre-init |
 
 ### Tests
 
@@ -89,6 +90,7 @@ cargo test --release -- --ignored --nocapture
 |-----|-------|-------|
 | `THREADS_LIMIT` | `threads_limit` | Worker thread count |
 | `WAIT_LIMIT` | `wait_limit` | Channel capacity per worker |
+| `MEMORY_LIMIT` | `memory_limit` | Arena allocator size in bytes, passed to `allocator::init()` |
 | `SERVER_ADDR` | `server_addr` | Listen IP |
 | `SERVER_PORT` | `server_port` | Listen port |
 | `PROC_LIMIT` | `proc_limit` | Parsed but currently unused |
@@ -103,3 +105,4 @@ cargo test --release -- --ignored --nocapture
 - Per-queue `auto_fail`: when enabled, after a Dequeue the server sleeps for `fail_timeout` **milliseconds** and then NACKs the just-sent message via `Queue::unlock`, putting it back on the queue for redelivery. An `is_locked` guard (held under the same Mutex acquisition as `unlock`) prevents both panic and stale NACK if the client acks first.
 - `NetStats` response payload: `StatMessage::to_bytes` now length-prefixes the queue name (2-byte BE u16 + bytes) and `StatWatcher::to_bytes` emits a `u32` BE count header followed by length-prefixed entries, so the payload is decodable in principle. The four numeric stat fields are still serialized as `usize`, which is platform-dependent (4 bytes on 32-bit targets, 8 on 64-bit) — a client on a different target cannot parse them reliably until they are cast to `u64` before `to_be_bytes()`.
 - `Queue::enqueue` derives the next message id from `self.order.last()`, but specific-id dequeue paths leave tombstone `0`s in `self.order` rather than removing the slot. If the trailing slot is a tombstone, the next id resolves to `1` and silently overwrites an existing `id=1` entry in `self.queue`. Should derive the next id from the max non-zero entry in `self.order`, or from a monotonic counter owned by `Queue`.
+- Arena allocator bump pointer (`offset`) is monotonic — it never reclaims space inline. Under sustained alloc/dealloc churn the bump region fills up even though freed blocks are available on the free list. All subsequent allocations must come from the free list; if no free-list block fits, allocation fails despite free capacity existing elsewhere. Defragmentation merges adjacent free blocks to mitigate fragmentation but cannot reclaim bump-pointer space.

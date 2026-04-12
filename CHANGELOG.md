@@ -1,5 +1,44 @@
 # Changelog
 
+## [0.6.0] - 2026-04-12
+
+### Features
+
+#### Custom arena allocator (`src/memory/allocator.rs`)
+- New `#[global_allocator]` — bump allocator with first-fit free-list reuse, background defragmentation, and system allocator fallback pre-init. Replaces the standard allocator with a single pre-committed arena (`VirtualAlloc` on Windows, `mmap` on Unix) sized by the `MEMORY_LIMIT` config field.
+- `AllocHeader` stored before each returned pointer allows `dealloc` to recover slot boundaries without relying on `Layout`.
+- Free-list with block splitting: when a free block is larger than needed by at least `MIN_SLOT_SIZE`, the remainder is split off and returned to the free list.
+- Background defragmentation thread (`arena-defrag`): triggered every 32nd dealloc via condvar, sorts the free list by address, and merges adjacent blocks.
+- `LOCKED_SIZE` tail reservation: `reserve_used` enforces `used + needed <= capacity - LOCKED_SIZE` on every allocation, ensuring headroom for incoming messages.
+- `set_locked_size()` with capacity guard — prevents setting a locked size that would exceed available space.
+- `get_free_mem_size()` returns `usize::MAX` when the arena isn't initialized, so the `read_buffer` payload size guard doesn't reject requests in test builds.
+- System allocator fallback for pre-init allocations and out-of-arena pointers in `dealloc`.
+
+#### `MEMORY_LIMIT` config field (`src/config.rs`, `src/main.rs`)
+- New `memory_limit: u64` field in `Config`, parsed from `MEMORY_LIMIT` key in `.settings`. Passed to `allocator::init()` on startup.
+
+### Bug Fixes
+
+#### `get_free_mem_size` returned 0 without arena (`src/memory/allocator.rs`)
+- When the arena wasn't initialized (e.g. in tests), `get_free_mem_size()` returned `0` (`allocated - used = 0 - 0`). This made `read_buffer`'s size guard `(payload_size * SIZE_FACTOR) >= get_free_mem_size()` always true, rejecting every payload. Fixed by returning `usize::MAX` when `allocated == 0`.
+
+#### `find_biggest_payloads` shift logic (`src/net/queue.rs`)
+- The inner shift loop always shifted ALL elements `[0..4]` left regardless of the insertion point (`decr_id`). When `decr_id < 4` this lost elements above the insertion point and created duplicates. Fixed to only shift `[0..decr_id]`.
+
+#### Stale `LOCKED_SIZE` TODO removed (`src/net/server.rs`)
+- The `TODO(bug)` about `server.rs` writing `LOCKED_SIZE` directly via `.store()` was outdated — the code already uses `set_locked_size()` for all writes. TODO removed.
+
+### Tests
+- Added `memory_limit: 0` to `make_config` in both `server_tests.rs` and `load_tests.rs` to match the new `Config` field.
+- All 34 unit tests pass; all 5 load tests pass (including 1 GB round-trip).
+
+### Documentation
+
+#### `CLAUDE.md`
+- Added `MEMORY_LIMIT` to Config Fields table.
+- Added `MemAllocator` to Key Types table.
+- Known Design Limitations: removed fixed `LOCKED_SIZE` bypass and `find_biggest_payloads` bug. Added arena bump-pointer exhaustion under churn.
+
 ## [0.5.3] - 2026-04-11
 
 ### Bug Fixes
