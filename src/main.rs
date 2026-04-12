@@ -2,6 +2,7 @@ mod net;
 mod config;
 mod tests;
 mod errors;
+mod memory;
 
 use std::collections::HashMap;
 use std::sync::Arc;

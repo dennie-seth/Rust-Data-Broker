@@ -1,6 +1,5 @@
 use std::collections::{HashMap};
 use std::io::ErrorKind;
-use std::iter::Sum;
 use std::sync::Arc;
 use bytes::BytesMut;
 use tokio::sync::RwLock;

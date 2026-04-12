@@ -1,10 +1,9 @@
 use std::collections::{HashMap};
 use std::io;
-use std::io::Read;
 use std::net::{SocketAddr, SocketAddrV4};
 use std::pin::Pin;
-use std::sync::{Arc, MutexGuard};
-use std::sync::atomic::{AtomicBool, AtomicUsize};
+use std::sync::{Arc};
+use std::sync::atomic::{AtomicUsize};
 use std::sync::atomic::Ordering::Relaxed;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -15,7 +14,7 @@ use tokio::net::tcp::OwnedWriteHalf;
 use uuid::Uuid;
 use crate::config::Config;
 use crate::errors::ErrorCode;
-use crate::errors::ErrorCode::{RequestParseError, ResponseFailedError};
+use crate::errors::ErrorCode::{ResponseFailedError};
 use crate::net::net_stats::StatWatcher;
 use crate::net::queue::{NetQueueConfig, Queue};
 
@@ -23,8 +22,8 @@ const COMMAND_SIZE: usize = 1usize;
 const PAYLOAD_SIZE: usize = 8usize;
 const CLIENT_ID_SIZE: usize = 16usize;
 const QUEUE_NAME_SIZE: usize = 64usize;
-// Will, probably, be modified later in config
-static MAX_PAYLOAD_SIZE: u64 = 4 * 1024 * 1024 * 1024;
+/// Will, probably, be modified later in config
+const MAX_PAYLOAD_SIZE: u64 = 4 * 1024 * 1024 * 1024;
 type Job = Pin<Box<dyn Future<Output = ()> + Send>>;
 #[derive(Debug)]
 pub(crate) struct Pool {

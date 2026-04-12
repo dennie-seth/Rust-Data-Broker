@@ -4,12 +4,14 @@ version = 4
 
 [[package]]
 name = "DataBroker"
-version = "0.5.3"
+version = "0.6.0"
 dependencies = [
  "bytes",
+ "libc 1.0.0-alpha.3",
  "regex",
  "tokio",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -76,7 +78,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0de51e6874e94e7bf76d726fc5d13ba782deca734ff60d5bb2fb2607c7406555"
 dependencies = [
  "cfg-if",
- "libc",
+ "libc 0.2.177",
  "r-efi",
  "wasip2",
  "wasip3",
@@ -150,6 +152,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2874a2af47a2325c2001a6e6fad9b16a53b802102b528163885171cf92b15976"
 
 [[package]]
+name = "libc"
+version = "1.0.0-alpha.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e136bfa874086c78f34d6eba98c423fefe464ce57f38164d16893ba8ed358e70"
+
+[[package]]
 name = "lock_api"
 version = "0.4.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -177,7 +185,7 @@ version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "78bed444cc8a2160f01cbcf811ef18cac863ad68ae8ca62092e8db51d51c761c"
 dependencies = [
- "libc",
+ "libc 0.2.177",
  "wasi",
  "windows-sys 0.59.0",
 ]
@@ -205,7 +213,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bc838d2a56b5b1a6c25f55575dfc605fabb63bb2365f6c2353ef9159aa69e4a5"
 dependencies = [
  "cfg-if",
- "libc",
+ "libc 0.2.177",
  "redox_syscall",
  "smallvec",
  "windows-targets 0.52.6",
@@ -355,7 +363,7 @@ version = "1.4.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b2a4719bff48cee6b39d12c020eeb490953ad2443b7055bd0b21fca26bd8c28b"
 dependencies = [
- "libc",
+ "libc 0.2.177",
 ]
 
 [[package]]
@@ -370,7 +378,7 @@ version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "17129e116933cf371d018bb80ae557e889637989d8638274fb25622827b03881"
 dependencies = [
- "libc",
+ "libc 0.2.177",
  "windows-sys 0.60.2",
 ]
 
@@ -392,7 +400,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ff360e02eab121e0bc37a2d3b4d4dc622e6eda3a8e5253d5435ecf5bd4c68408"
 dependencies = [
  "bytes",
- "libc",
+ "libc 0.2.177",
  "mio",
  "parking_lot",
  "pin-project-lite",
