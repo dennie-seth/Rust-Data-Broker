@@ -11,7 +11,7 @@ static ARENA_BASE: AtomicPtr<u8> = AtomicPtr::new(null_mut());
 
 /// Tail reservation: 2x the biggest message received + overhead.
 /// Mutated from `server.rs` via `set_locked_size()`.
-static LOCKED_SIZE: AtomicUsize = AtomicUsize::new(0);
+pub static LOCKED_SIZE: AtomicUsize = AtomicUsize::new(0);
 static DEALLOC_COUNT: AtomicUsize = AtomicUsize::new(0);
 // Condvar pair for waking the background thread. Neither allocates on
 // wait/notify (futex on Linux, SRW+CV on Windows), so it's safe to use

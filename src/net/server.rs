@@ -3,8 +3,7 @@ use std::io;
 use std::net::{SocketAddr, SocketAddrV4};
 use std::pin::Pin;
 use std::sync::{Arc};
-use std::sync::atomic::{AtomicUsize};
-use std::sync::atomic::Ordering::Relaxed;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -15,6 +14,7 @@ use uuid::Uuid;
 use crate::config::Config;
 use crate::errors::ErrorCode;
 use crate::errors::ErrorCode::{ResponseFailedError};
+use crate::memory::allocator::LOCKED_SIZE;
 use crate::net::net_stats::StatWatcher;
 use crate::net::queue::{NetQueueConfig, Queue};
 
@@ -50,7 +50,7 @@ impl Pool {
                 while let Ok(job) = receiver.recv() {
                     println!("[worker {:?}] got a job", std::thread::current().id());
                     runtime.block_on(job);
-                    counter.fetch_sub(1, Relaxed);
+                    counter.fetch_sub(1, Ordering::Relaxed);
                     println!("[worker {:?}] finished job", std::thread::current().id());
                 }
             });
@@ -65,13 +65,13 @@ impl Pool {
         let worker_id = self.pressure.
             iter().
             enumerate().
-            min_by_key(|(_, counter)| counter.load(Relaxed)).
+            min_by_key(|(_, counter)| counter.load(Ordering::Relaxed)).
             map(|(id, _)| id).
             unwrap_or(0);
 
-        self.pressure[worker_id].fetch_add(1, Relaxed);
+        self.pressure[worker_id].fetch_add(1, Ordering::Relaxed);
 
-        let sender = self.map.get(&worker_id).ok_or_else(|| { self.pressure[worker_id].fetch_sub(1, Relaxed); io::Error::new(io::ErrorKind::BrokenPipe, "worker not found") } )?;
+        let sender = self.map.get(&worker_id).ok_or_else(|| { self.pressure[worker_id].fetch_sub(1, Ordering::Relaxed); io::Error::new(io::ErrorKind::BrokenPipe, "worker not found") } )?;
         let sender = sender.clone();
         let job = Box::pin(future) as Job;
         tokio::task::spawn_blocking( move | | sender.send(job)).await.
@@ -228,6 +228,9 @@ macro_rules! invalid_message_id {
         }
     }
 }
+
+const SIZE_FACTOR: f64 = 2.25f64;
+
 impl Server {
     fn new(addr: Addr, stop_word: Arc<Notify>, stop_accepting: Arc<Notify>) -> Self {
 
@@ -275,7 +278,7 @@ impl Server {
                 }
             }
             loop {
-                if self.active_connections.load(Relaxed) == 0 { break; }
+                if self.active_connections.load(Ordering::Relaxed) == 0 { break; }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
             drained.notify();
@@ -283,11 +286,11 @@ impl Server {
         Ok(())
     }
     async fn handle_connection(&self, stream: TcpStream, stop_word: Arc<Notify>) {
-        self.active_connections.fetch_add(1, Relaxed);
+        self.active_connections.fetch_add(1, Ordering::Relaxed);
         if let Err(err) = self.clone().read_buffer(stream, stop_word.clone()).await {
             println!("[worker {:?}] read_buffer error {:?}", std::thread::current().id(), err);
         }
-        self.active_connections.fetch_sub(1, Relaxed);
+        self.active_connections.fetch_sub(1, Ordering::Relaxed);
     }
     async fn spawn_connection(self, pool: Arc<Pool>, socket: TcpStream, stop_word: Arc<Notify>, addr: SocketAddr) -> Result<(), std::io::Error>{
         println!("New connection from {}", addr);
@@ -356,9 +359,20 @@ impl Server {
         let queue_lock = self.queue.read().await;
         match self.get_queue(&queue_lock, &queue_name).await {
             Ok(queue) => {
-                let cleared = queue.lock().await.dequeue(client_id, message_id).await;
+                let mut lock = queue.lock().await;
+                let cleared = lock.dequeue(client_id, message_id).await;
                 return match cleared {
-                    Ok(_) => {
+                    Ok(size) => {
+                        if (size as f64 * SIZE_FACTOR) as usize >= LOCKED_SIZE.load(Ordering::Relaxed) {
+                            match lock.get_next_biggest_payload() {
+                                Ok(size) => {
+                                    LOCKED_SIZE.store(size, Ordering::Release);
+                                },
+                                Err(err) => {
+                                    println!("[worker {:?}] get_next_biggest_payload error {:?}", std::thread::current().id(), err);
+                                }
+                            };
+                        }
                         Ok(())
                         }
                     Err(err) => {
@@ -447,6 +461,11 @@ impl Server {
                                 Ok(queue) => {
                                     match queue.lock().await.enqueue(message.payload, client_id) {
                                         Ok(_) => {
+                                            let size = (payload_size as f64 * SIZE_FACTOR) as usize;
+                                            if  size > LOCKED_SIZE.load(Ordering::Relaxed) {
+                                                LOCKED_SIZE.store(size, Ordering::Release);
+                                            }
+
                                             let response = ResponseMessage::new(Response::Succeeded, vec!());
                                             server.clone().send_response(writer, &response).await;
                                         }
